@@ -42,9 +42,13 @@ def create_langevin_step_function(
         return step_single
 
     def step_n(x: jnp.ndarray, v: jnp.ndarray, key: jax.random.PRNGKey, **kwargs) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        for _ in range(num_steps):
+        def scan_step(carry, _):
+            x, v, key = carry
             key, step_key = jax.random.split(key)
             x, v = step_single(x, v, step_key, **kwargs)
+            return (x, v, key), None
+
+        (x, v, _), _ = jax.lax.scan(scan_step, (x, v, key), None, length=num_steps)
         return x, v
 
     return step_n

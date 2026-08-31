@@ -11,6 +11,7 @@ log = logging.getLogger(__name__)
 class Datapoints(struct.PyTreeNode):
     data: jnp.ndarray
     features: Optional[jnp.ndarray]
+    forces: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.data.ndim != 2:
@@ -22,12 +23,21 @@ class Datapoints(struct.PyTreeNode):
                 raise ValueError(
                     f"First dimension of data ({self.data.shape[0]}) and features ({self.features.shape[0]}) must match."
                 )
+        if self.forces is not None:
+            if self.forces.shape != self.data.shape:
+                raise ValueError(
+                    f"forces must have the same shape as data; got {self.forces.shape} and {self.data.shape}."
+                )
 
     def __len__(self):
         return self.data.shape[0]
 
     def __getitem__(self, idx: int):
-        return Datapoints(self.data[idx], self.features[idx] if self.features is not None else None)
+        return Datapoints(
+            self.data[idx],
+            self.features[idx] if self.features is not None else None,
+            forces=self.forces[idx] if self.forces is not None else None,
+        )
 
 
 @dataclass

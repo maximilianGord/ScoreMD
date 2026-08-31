@@ -5,9 +5,11 @@ from scoremd.utils.file import (
 )  # this should be the very first line so that the .env file is loaded
 import logging
 import os
+import functools
 from typing import Callable, List, Optional
 import jax
 import jax.numpy as jnp
+import numpy as np
 import matplotlib.pyplot as plt
 import optax
 import orbax.checkpoint as ocp
@@ -19,6 +21,8 @@ from scoremd.data.preprocess import CenterMolecule
 import scoremd.models as diffusion_models
 import wandb as wandb_lib
 from scoremd.data.dataset import ToyDataset, Dataset, MuellerBrownSimulation
+from scoremd.data.dataset.base import Datapoints
+from scoremd.data.dataset.utils import compute_full_atom_sigma_mode
 from scoremd.models.mixture import MixtureOfModels
 from scoremd.training import load_and_train, TrainingSchedule
 from scoremd.training.train_state import EmaTrainState
@@ -30,6 +34,80 @@ from scoremd.utils.ranges import assert_range_continuity
 from stores import create_dataset_store, create_trainig_schedule_store, create_weighting_store, create_optimizer_store
 
 log = logging.getLogger(__name__)
+
+
+def _loss_options(ranged_loss) -> dict:
+    """Return the configured keyword arguments of a Hydra-Zen loss partial."""
+    return dict(getattr(ranged_loss.loss, "keywords", {}) or {})
+
+
+def _set_runtime_loss_options(ranged_loss, **options) -> None:
+    """Bind run-specific values without mutating another ranged loss's partial."""
+    loss_factory = ranged_loss.loss
+    if not isinstance(loss_factory, functools.partial):
+        raise TypeError("TSM runtime options require a functools.partial loss factory.")
+    keywords = dict(loss_factory.keywords or {})
+    keywords.update(options)
+    ranged_loss.loss = functools.partial(loss_factory.func, *loss_factory.args, **keywords)
+
+
+def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Optional[Datapoints]:
+    """Attach physical forces to datapoints before entering JAX training."""
+    if datapoints is None or datapoints.forces is not None:
+        return datapoints
+    if not hasattr(dataset, "force") or not callable(dataset.force):
+        raise TypeError("loss_type='tsm' requires a dataset with a callable force(frame) method.")
+
+    sample_shape = tuple(dataset.sample_shape)
+    if len(sample_shape) != 2 or sample_shape[-1] != 3:
+        raise ValueError("loss_type='tsm' currently supports only full-atom datasets with sample_shape=(n_atoms, 3).")
+    if datapoints.data.shape[1] != int(np.prod(sample_shape)):
+        raise ValueError(
+            "Datapoint coordinate dimension does not match dataset.sample_shape; "
+            "cannot prepare full-atom TSM forces."
+        )
+
+    frames = np.asarray(datapoints.data).reshape((-1, *sample_shape))
+    forces = np.empty_like(frames)
+    log.info("Precomputing physical forces for %d TSM samples.", len(frames))
+    for index, frame in enumerate(frames):
+        force = np.asarray(dataset.force(jnp.asarray(frame)), dtype=frames.dtype)
+        if force.shape != frame.shape:
+            raise ValueError(f"dataset.force returned {force.shape}; expected {frame.shape}.")
+        forces[index] = force
+    return datapoints.replace(forces=jnp.asarray(forces.reshape(datapoints.data.shape)))
+
+
+def _prepare_tsm_inputs(
+    dataset: Dataset,
+    training_schedule,
+    train_data: Datapoints,
+    val_data: Optional[Datapoints],
+    norm_factor: jnp.ndarray,
+) -> tuple[Datapoints, Optional[Datapoints]]:
+    """Prepare static TSM inputs once, before the JIT-compiled training loop."""
+    tsm_losses = [loss for loss in training_schedule.losses if _loss_options(loss).get("loss_type", "dsm") == "tsm"]
+    if not tsm_losses:
+        return train_data, val_data
+
+    train_data = _precompute_forces(dataset, train_data)
+    val_data = _precompute_forces(dataset, val_data)
+    for ranged_loss in tsm_losses:
+        _set_runtime_loss_options(ranged_loss, kbT=float(dataset.kbT))
+
+    mode_mixture_losses = [loss for loss in tsm_losses if _loss_options(loss).get("tsm_type") == "mode_mixture"]
+    if not mode_mixture_losses:
+        return train_data, val_data
+    if np.asarray(norm_factor).size != 1:
+        raise ValueError("Full-atom mode-mixture TSM currently requires a scalar coordinate norm_factor.")
+
+    sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
+    sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
+    log.info("Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; diagnostics=%s", sigma_mode_sq,
+             sigma_mode_sq_normalized, diagnostics)
+    for ranged_loss in mode_mixture_losses:
+        _set_runtime_loss_options(ranged_loss, sigma_mode_sq=sigma_mode_sq_normalized, kbT=float(dataset.kbT))
+    return train_data, val_data
 
 
 def training_routine(
@@ -133,6 +211,8 @@ def training_routine(
         # also, not everything is perfectly centered
         norm_factor = 1.0
     log.info(f"Normalization factor: {norm_factor}")
+
+    train_data, val_data = _prepare_tsm_inputs(dataset, training_schedule, train_data, val_data, norm_factor)
 
     unified_model = MixtureOfModels(
         [m.build(dataset, norm_factor) for m in ranged_models], weighting_function, CenterMolecule(dataset)

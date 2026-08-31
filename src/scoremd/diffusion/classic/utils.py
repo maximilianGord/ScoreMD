@@ -11,7 +11,6 @@ import logging
 from jax.typing import ArrayLike
 from flax.core import FrozenDict
 from scoremd.utils.diffusion import batch_mul, get_score
-import scoremd.diffusion.classic.sde as sdes
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +77,14 @@ def get_loss(
     beta=0.0,
     gamma=1.0,
     fp_dist="pert",
+    loss_type: str = "dsm",
+    tsm_type: str = "constant",
+    tsm_lambda: float = 1.0,
+    tsm_t0: float = 0.05,
+    tsm_sigma_max: float = 0.01,
+    sigma_data: float = 1.0,
+    sigma_mode_sq: Optional[float] = None,
+    kbT: float = 1.0,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -97,8 +104,24 @@ def get_loss(
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
     """
+    if loss_type not in ("dsm", "tsm"):
+        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm' or 'tsm'.")
+    if loss_type == "tsm" and tsm_type not in (
+        "constant",
+        "hard_cutoff",
+        "smooth_decay",
+        "linear",
+        "linear_decay",
+        "noise_cutoff",
+        "mode_mixture",
+    ):
+        raise ValueError(f"Unknown tsm_type={tsm_type!r}.")
+
     log.info("Using VP-SDE")
-    sde = sdes.VP()
+    from scoremd.diffusion.classic.sde import VP
+    from scoremd.diffusion.tsm import tsm_loss
+
+    sde = VP()
     from scoremd.diffusion.fp import fp_vp_loss
 
     reduce_op = jnp.mean if reduce_mean else lambda *args, **kwargs: 0.5 * jnp.sum(*args, **kwargs)
@@ -108,6 +131,7 @@ def get_loss(
         rng: ArrayLike,
         batch: ArrayLike,
         features: Optional[ArrayLike],
+        forces: Optional[ArrayLike],
         ts: ArrayLike,
         is_special_epoch: bool,
         training: bool,
@@ -251,11 +275,62 @@ def get_loss(
                 losses = losses * g2
 
             losses *= time_weighting(ts)
-            diffusion_loss = jnp.mean(losses)
+            diffusion_loss = jnp.mean(losses)  # scalar
+        if loss_type == "tsm":
+            if forces is None:
+                raise ValueError("loss_type='tsm' requires precomputed per-sample forces.")
+            if tsm_type == "mode_mixture":
+                target_score_losses, kappas, lambdas = tsm_loss(
+                    error_rng,
+                    sde,
+                    score,
+                    perturbed_data,
+                    forces,
+                    features,
+                    ts,
+                    time_weighting,
+                    tsm_type,
+                    tsm_lambda,
+                    tsm_t0,
+                    tsm_sigma_max,
+                    sigma_data=sigma_data,
+                    sigma_mode_sq=sigma_mode_sq,
+                    kbT=kbT,
+                    reduce=reduce_op,
+                )
+                combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
+            else:
+                target_score_losses, _, _ = tsm_loss(
+                    error_rng,
+                    sde,
+                    score,
+                    perturbed_data,
+                    forces,
+                    features,
+                    ts,
+                    time_weighting,
+                    tsm_type,
+                    tsm_lambda,
+                    tsm_t0,
+                    tsm_sigma_max,
+                    sigma_data=sigma_data,
+                    sigma_mode_sq=sigma_mode_sq,
+                    kbT=kbT,
+                    reduce=reduce_op,
+                )
+                combined_per_sample = losses + target_score_losses
+            diffusion_loss = reduce_op(combined_per_sample)
 
         return gamma * diffusion_loss, vector_fp, scalar_fp
 
     return loss
+
+
+def get_tsm_loss(model, time_weighting, evaluated_models, **kwargs):
+    """Build the DSM + target-score-matching loss used by ``loss_type='tsm'``."""
+    if "loss_type" in kwargs and kwargs["loss_type"] != "tsm":
+        raise ValueError("get_tsm_loss always constructs loss_type='tsm'.")
+    return get_loss(model, time_weighting, evaluated_models, loss_type="tsm", **kwargs)
 
 
 def get_karras_sigma_function(sigma_min, sigma_max, rho=7):
@@ -448,7 +523,6 @@ def get_sampler(
         if x_0 is None:
             if inner_solver:
                 x = inner_solver.prior(step_rng, shape)
-            else:
                 x = outer_solver.prior(step_rng, shape)
         else:
             assert x_0.shape == shape

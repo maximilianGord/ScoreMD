@@ -135,6 +135,12 @@ def create_trainig_schedule_store(store):
         div_est=1,
         gaussian_div_est=False,
         partial_t_approx=False,
+        loss_type="dsm",
+        tsm_type="constant",
+        tsm_lambda=1.0,
+        tsm_t0=0.05,
+        tsm_sigma_max=0.01,
+        sigma_data=1.0,
         zen_partial=True,
         populate_full_signature=True,
     )

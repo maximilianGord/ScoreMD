@@ -44,3 +44,11 @@ def apply_random_rotations(batch: ArrayLike, features: Optional[ArrayLike], key:
     return (jnp.einsum("bij,bnj->bni", R_batch, batch_centered) + batch_offset).reshape(
         orig_shape
     )  # Efficient batch matrix multiplication
+
+
+def apply_random_rotations_to_vectors(vectors: ArrayLike, key: ArrayLike) -> ArrayLike:
+    """Apply the same kind of random rotations to vector quantities such as forces."""
+    orig_shape = vectors.shape
+    vectors = vectors.reshape(vectors.shape[0], -1, 3)
+    rotations = batch_random_rotation_matrices(key, vectors.shape[0])
+    return jnp.einsum("bij,bnj->bni", rotations, vectors).reshape(orig_shape)

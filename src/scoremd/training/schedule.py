@@ -11,6 +11,7 @@ import logging
 from itertools import accumulate
 import optax
 from scoremd.data.dataset.base import Datapoints
+from scoremd.data.augment import apply_random_rotations, apply_random_rotations_to_vectors
 from scoremd.loss import RangedLoss
 from scoremd.models.mixture import MixtureOfModels
 from scoremd.training.train_state import EmaTrainState
@@ -99,6 +100,7 @@ class TrainingSchedule(abc.ABC):
         state: EmaTrainState,
         batch: ArrayLike,
         features: Optional[ArrayLike],
+        forces: Optional[ArrayLike],
         ts: ArrayLike,
         is_special_epoch: bool,
         validation: bool,
@@ -111,6 +113,7 @@ class TrainingSchedule(abc.ABC):
             key: ArrayLike,
             batch: ArrayLike,
             features: Optional[ArrayLike],
+            forces: Optional[ArrayLike],
             ts: ArrayLike,
             is_special_epoch: bool,
         ) -> Tuple[ArrayLike, ArrayLike]:
@@ -120,7 +123,7 @@ class TrainingSchedule(abc.ABC):
                 loss_match = jnp.any((ts < t1) & (ts > t0))
                 cur_loss, cur_aux = jax.lax.cond(
                     loss_match,
-                    lambda: loss_fn(params, key, batch, features, ts, is_special_epoch),
+                    lambda: loss_fn(params, key, batch, features, forces, ts, is_special_epoch),
                     lambda: (jnp.sum(jnp.array([0.0])), jnp.array([0.0, 0.0, 0.0])),
                 )
 
@@ -129,7 +132,7 @@ class TrainingSchedule(abc.ABC):
             return sum_loss, sum_aux
 
         return TrainingSchedule._train_step_single_loss(
-            merged_loss, state, batch, features, ts, is_special_epoch, validation, key
+            merged_loss, state, batch, features, forces, ts, is_special_epoch, validation, key
         )
 
     @staticmethod
@@ -138,16 +141,17 @@ class TrainingSchedule(abc.ABC):
         state: EmaTrainState,
         batch: ArrayLike,
         features: Optional[ArrayLike],
+        forces: Optional[ArrayLike],
         ts: ArrayLike,
         is_special_epoch: bool,
         validation: bool,
         key: ArrayLike,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
-            _, loss = loss_fn(state.params, key, batch, features, ts, is_special_epoch, False)
+            _, loss = loss_fn(state.params, key, batch, features, forces, ts, is_special_epoch, False)
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, key, batch, features, ts, is_special_epoch, True
+            state.params, key, batch, features, forces, ts, is_special_epoch, True
         )
 
         state = state.apply_gradients(grads=grads)
@@ -182,14 +186,24 @@ class TrainingSchedule(abc.ABC):
 
             current_data = datapoints.data[perm, ...]
             current_features = datapoints.features[perm, ...] if datapoints.features is not None else None
+            current_forces = datapoints.forces[perm, ...] if datapoints.forces is not None else None
             if data_sharding is not None:
                 current_data = jax.lax.with_sharding_constraint(current_data, data_sharding)
                 if current_features is not None:
                     current_features = jax.lax.with_sharding_constraint(current_features, data_sharding)
+                if current_forces is not None:
+                    current_forces = jax.lax.with_sharding_constraint(current_forces, data_sharding)
 
             # augment the data (e.g., random rotations)
             current_data = self.augment(current_data, current_features, augment_key)
+            if current_forces is not None:
+                if self.augment is apply_random_rotations:
+                    current_forces = apply_random_rotations_to_vectors(current_forces, augment_key)
+                else:
+                    current_forces = self.augment(current_forces, current_features, augment_key)
             current_data *= norm_factor
+            if current_forces is not None:
+                current_forces /= norm_factor
 
             cur_losses = []
             for ts, possible_loss in sample_ts(iter_key):
@@ -202,6 +216,7 @@ class TrainingSchedule(abc.ABC):
                         state,
                         current_data,
                         current_features,
+                        current_forces,
                         ts,
                         is_special_epoch,
                         validation,
@@ -213,6 +228,7 @@ class TrainingSchedule(abc.ABC):
                         state,
                         current_data,
                         current_features,
+                        current_forces,
                         ts,
                         is_special_epoch,
                         validation,

@@ -85,6 +85,57 @@ python train.py dataset=aldp \
   +wandb.name=aldp-baseline
 ```
 
+### TSM Mode Mixture
+```bash
+python train.py dataset=aldp \
+  dataset.limit_samples=50_000 \
+  dataset.validation=False \
+  +architecture=transformer/potential \
+  training_schedule.epochs.0=10000 \
+  training_schedule.BS=512 \
+  checkpoint_options.save_interval_steps=1000 \
+  training_schedule.losses.0.loss.loss_type=tsm \
+  training_schedule.losses.0.loss.tsm_type=mode_mixture \
+  training_schedule.losses.0.loss.beta=0 \
+  +training_schedule/augment=random_rotations \
+  dataset.coarse_graining_level=none \
+  evaluation.num_parallel_langevin_samples=100 \
+  evaluation.langevin_dt=2e-3 \
+  evaluation.num_langevin_intermediate_steps=50 \
+  evaluation.num_langevin_samples=120000 \
+  evaluation.eval_t=1e-5 \
+  wandb.enabled=False \
+  +wandb.name=aldp-tsm-mode-mixture
+```
+
+This computes the full-atom mode variance once before training and uses it to
+mix the DSM and target-score terms.
+
+### TSM Noise Cutoff
+```bash
+python train.py dataset=aldp \
+  dataset.limit_samples=50_000 \
+  dataset.validation=False \
+  +architecture=transformer/potential \
+  training_schedule.epochs.0=10000 \
+  training_schedule.BS=512 \
+  checkpoint_options.save_interval_steps=1000 \
+  training_schedule.losses.0.loss.loss_type=tsm \
+  training_schedule.losses.0.loss.tsm_type=noise_cutoff \
+  training_schedule.losses.0.loss.tsm_lambda=0.001 \
+  training_schedule.losses.0.loss.tsm_sigma_max=0.01 \
+  training_schedule.losses.0.loss.beta=0 \
+  +training_schedule/augment=random_rotations \
+  dataset.coarse_graining_level=none \
+  evaluation.num_parallel_langevin_samples=100 \
+  evaluation.langevin_dt=2e-3 \
+  evaluation.num_langevin_intermediate_steps=50 \
+  evaluation.num_langevin_samples=120000 \
+  evaluation.eval_t=1e-5 \
+  wandb.enabled=False \
+  +wandb.name=aldp-tsm-noise-cutoff
+```
+
 ### Mixture
 ```bash
 python train.py dataset=aldp \

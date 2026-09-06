@@ -67,11 +67,11 @@ python train.py dataset=aldp \
   dataset.validation=False \
   +architecture=transformer/potential \
   training_schedule.epochs.0=10000 \
-  training_schedule.BS=1024 \
+  training_schedule.BS=512 \
   checkpoint_options.save_interval_steps=1000 \
   training_schedule.losses.0.loss.beta=0 \
   +training_schedule/augment=random_rotations \
-  dataset.coarse_graining_level=full \
+  dataset.coarse_graining_level=none \
   evaluation.num_parallel_langevin_samples=100 \
   evaluation.langevin_dt=2e-3 \
   evaluation.num_langevin_intermediate_steps=50 \
@@ -81,7 +81,7 @@ python train.py dataset=aldp \
   +training_schedule.losses.0.loss.residual_fp=True \
   training_schedule.losses.0.loss.partial_t_approx=True \
   +training_schedule.losses.0.loss.single_gamma=True \
-  wandb.enabled=True \
+  wandb.enabled=False \
   +wandb.name=aldp-baseline
 ```
 
@@ -173,11 +173,11 @@ python train.py dataset=aldp \
   dataset.validation=False \
   +architecture=transformer/potential \
   training_schedule.epochs.0=10000 \
-  training_schedule.BS=1024 \
+  training_schedule.BS=512 \
   checkpoint_options.save_interval_steps=1000 \
   training_schedule.losses.0.loss.beta=0.0005 \
   +training_schedule/augment=random_rotations \
-  dataset.coarse_graining_level=full \
+  dataset.coarse_graining_level=none \
   evaluation.num_parallel_langevin_samples=100 \
   evaluation.langevin_dt=2e-3 \
   evaluation.num_langevin_intermediate_steps=50 \
@@ -187,7 +187,7 @@ python train.py dataset=aldp \
   +training_schedule.losses.0.loss.residual_fp=True \
   training_schedule.losses.0.loss.partial_t_approx=True \
   +training_schedule.losses.0.loss.single_gamma=True \
-  wandb.enabled=True \
+  wandb.enabled=False \
   +wandb.name=aldp-fp-0.0005
 ```
 

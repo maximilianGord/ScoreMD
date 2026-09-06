@@ -523,6 +523,7 @@ def get_sampler(
         if x_0 is None:
             if inner_solver:
                 x = inner_solver.prior(step_rng, shape)
+            else:
                 x = outer_solver.prior(step_rng, shape)
         else:
             assert x_0.shape == shape

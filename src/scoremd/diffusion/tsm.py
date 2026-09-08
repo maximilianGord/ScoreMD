@@ -12,8 +12,65 @@ if TYPE_CHECKING:
     import scoremd.diffusion.classic.sde as sdes
 
 
-def _optimal_tsm_lambda(sigma_sq: jnp.ndarray, sigma_data_sq: jnp.ndarray) -> jnp.ndarray:
-    return (sigma_sq * sigma_data_sq) / jnp.maximum(sigma_sq + sigma_data_sq, 1e-12)
+from typing import Literal
+
+LambdaScheme = Literal["song", "dsm_optimal", "tsm_optimal", "uniform"]
+
+
+def compute_lambda_t(
+    sigma_sq: jnp.ndarray,
+    sigma_data_sq: jnp.ndarray,
+    alpha_sq: jnp.ndarray | float = 1.0,
+    scheme: LambdaScheme = "uniform",
+    eps: float = 1e-12,
+) -> jnp.ndarray:
+    """Time-weighting lambda_t for the score-matching loss.
+
+    Implements the four schemes compared in De Bortoli et al. 2024
+    (Target Score Matching), Section 4.1 / Figure 4.
+
+    Args:
+        sigma_sq: sigma_t^2, noise variance at time t. Any shape.
+        sigma_data_sq: sigma_data^2 (or v_mode, for the mode-variance /
+            kappa-bar version). Broadcastable against sigma_sq.
+        alpha_sq: alpha_t^2, signal scale squared at time t. Only used by
+            "tsm_optimal". Defaults to 1.0 (VE-style schedules); pass the
+            real alpha_t^2 for VP/cosine schedules.
+        scheme:
+            "song"        -> lambda_t = 1 / sigma_t^2  (Song et al. 2021)
+            "dsm_optimal" -> unit-variance-at-init weighting for *pure* DSM
+            "tsm_optimal" -> unit-variance-at-init weighting for *pure* TSM
+            "uniform"     -> lambda_t = 1  (what the paper actually trains
+                              kappa/kappa-bar mixtures with — default here)
+        eps: numerical floor to avoid division by zero.
+
+    Returns:
+        lambda_t, same shape as sigma_sq (broadcast).
+    """
+    sigma_sq = jnp.asarray(sigma_sq)
+    sigma_data_sq = jnp.asarray(sigma_data_sq)
+    alpha_sq = jnp.asarray(alpha_sq)
+
+    if scheme == "song":
+        return 1.0 / jnp.maximum(sigma_sq, eps)
+
+    if scheme == "dsm_optimal":
+        # lambda_t = (sigma_t^2 / sigma_data^2) * (sigma_t^2 + sigma_data^2)
+        return (sigma_sq / jnp.maximum(sigma_data_sq, eps)) * (sigma_sq + sigma_data_sq)
+
+    if scheme == "tsm_optimal":
+        # lambda_t = (alpha_t^2 sigma_data^2 / sigma_t^2) * (sigma_t^2 + alpha_t^2 sigma_data^2)
+        return (alpha_sq * sigma_data_sq / jnp.maximum(sigma_sq, eps)) * (
+            sigma_sq + alpha_sq * sigma_data_sq
+        )
+
+    if scheme == "uniform":
+        return jnp.ones_like(sigma_sq)
+
+    raise ValueError(
+        f"Unknown lambda_t weighting scheme {scheme!r}; expected one of "
+        "('song', 'dsm_optimal', 'tsm_optimal', 'uniform')."
+    )
 
 
 def tsm_weight(

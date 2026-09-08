@@ -316,9 +316,18 @@ def training_routine(
     for losses, prefix, filename in zip([train_losses, val_losses], ["Training", "Validation"], ["loss", "val_loss"]):
         if losses is None or len(losses) == 0:
             continue
+
+        # Persist the numerical histories as well as the rendered figures. Keeping
+        # one file per component makes it possible to restyle/replot a completed
+        # run without training again: loss0.npy, ..., lossN.npy (and validation
+        # equivalents) each contain one value per epoch.
+        losses_np = np.asarray(losses)
+        np.save(f"{out_dir}/{filename}.npy", losses_np)
+        np.save(f"{out_dir}/{filename}_total.npy", losses_np.sum(axis=-1))
+
         plt.figure(clear=True)
         plt.title(f"{prefix} - Loss")
-        plt.plot(losses.sum(axis=-1))
+        plt.plot(losses_np.sum(axis=-1))
         plt.xlabel("Epoch")
         plt.ylabel("Loss")
         plt.savefig(f"{out_dir}/{filename}.png", bbox_inches="tight")
@@ -326,10 +335,11 @@ def training_routine(
 
         for i, (loss, title) in enumerate(
             zip(
-                losses.T,
+                losses_np.T,
                 ["Diffusion Loss", "Vector FP Loss", "Scalar FP Loss", "TSM Loss", "SC Loss"],
             )
         ):
+            np.save(f"{out_dir}/{filename}{i}.npy", loss)
             if jnp.any(jnp.abs(loss) > 1e-6):
                 plt.figure(clear=True)
                 plt.title(f"{prefix} - {title}")

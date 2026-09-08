@@ -22,8 +22,8 @@ def write_animation_with_topology(trajectory: jnp.ndarray, topology: app.Topolog
 
 def _validate_full_atom_frames(data_full: Array) -> Array:
     frames = np.asarray(data_full, dtype=float)
-    if frames.ndim != 3 or frames.shape[-1] != 3 or frames.shape[0] == 0:
-        raise ValueError("data_full must be a non-empty array with shape (n_frames, n_atoms, 3).")
+    if frames.ndim < 2 or frames.shape[0] == 0:
+        raise ValueError("data_full must be a non-empty array with a leading frame dimension.")
     if not np.all(np.isfinite(frames)):
         raise ValueError("data_full must contain only finite coordinates.")
     return frames
@@ -84,8 +84,8 @@ def directional_hessian_curvature(
     """
     frame = np.asarray(frame_full, dtype=float)
     direction = np.asarray(direction, dtype=float)
-    if frame.ndim != 2 or frame.shape[-1] != 3:
-        raise ValueError(f"frame_full must have shape (n_atoms, 3); got {frame.shape}.")
+    if frame.ndim < 1:
+        raise ValueError(f"frame_full must contain at least one coordinate; got {frame.shape}.")
     if frame.shape != direction.shape:
         raise ValueError(
             "direction must have the same shape as a full frame; "
@@ -122,7 +122,10 @@ def compute_sigma_mode(
     direction_fn: Optional[Callable[[Array], Array]] = None,
     return_diagnostics: bool = False,
 ) -> float | tuple[float, dict[str, float | int]]:
-    """Estimate a full-atom TSM mode variance from local force curvatures.
+    """Estimate a TSM mode variance from local force curvatures.
+
+    Cartesian atom coordinates have rigid-body modes removed; other coordinate
+    shapes, such as Mueller-Brown's (2, 1), use coordinate directions directly.
 
     The estimator returns ``mean[1 / (beta * v.T @ Hessian(U) @ v)]`` over a
     reproducible frame/direction subsample.  By default it samples Cartesian
@@ -164,10 +167,10 @@ def compute_sigma_mode(
             directions = np.asarray(direction_fn(frame), dtype=float)
             if directions.shape == frame.shape:
                 directions = directions[None, ...]
-            if directions.ndim != 3 or directions.shape[1:] != frame.shape:
+            if directions.ndim != frame.ndim + 1 or directions.shape[1:] != frame.shape:
                 raise ValueError(
-                    "direction_fn must return shape (n_directions, n_atoms, 3) "
-                    f"or (n_atoms, 3); got {directions.shape}."
+                    "direction_fn must return shape (n_directions, *frame.shape) "
+                    f"or frame.shape; got {directions.shape}."
                 )
             if directions.shape[0] > directions_per_frame:
                 selected = rng.choice(directions.shape[0], size=directions_per_frame, replace=False)
@@ -175,7 +178,7 @@ def compute_sigma_mode(
 
         for direction in directions:
             try:
-                if project_rigid_body_modes:
+                if project_rigid_body_modes and frame.ndim == 2 and frame.shape[-1] == 3:
                     direction = _project_out_rigid_body_modes(direction, frame)
                 else:
                     norm = np.linalg.norm(direction)
@@ -228,8 +231,6 @@ def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict
     CG loss.  Other datasets fall back to their training coordinates.
     """
     sample_shape = tuple(dataset.sample_shape)
-    if len(sample_shape) != 2 or sample_shape[-1] != 3:
-        raise ValueError("Sigma-mode estimation requires dataset.sample_shape = (n_atoms, 3).")
     if not hasattr(dataset, "force") or not callable(dataset.force):
         raise TypeError("Dataset must provide a callable force(frame) for Hessian estimation.")
 
@@ -238,5 +239,6 @@ def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict
         dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
     )
     coordinate_source = full_coordinates if full_coordinates is not None else datapoints.data
-    frames = np.asarray(coordinate_source, dtype=float).reshape((len(datapoints), -1, 3))
+    frame_shape = (-1, 3) if full_coordinates is not None else sample_shape
+    frames = np.asarray(coordinate_source, dtype=float).reshape((len(datapoints), *frame_shape))
     return compute_sigma_mode(frames, dataset.force, beta=1.0 / float(dataset.kbT), **kwargs)

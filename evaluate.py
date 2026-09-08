@@ -110,10 +110,19 @@ def evaluate(
             metrics |= evaluate_toy_normalization_constant(model, params, out_dir)
     elif isinstance(dataset, MuellerBrownSimulation):
         metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
+        ground_truth_marginals = mueller_brown_marginals(dataset)
         metrics |= evaluate_mueller_brown_samples(
-            dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
+            dataset.train,
+            dataset,
+            trained_unnormalized_score,
+            norm_factor,
+            out_dir,
+            ground_truth_marginals,
+            seed=evaluation.seed,
         )
-        metrics |= simulate_mueller_brown(dataset.train, dataset, force, out_dir, seed=evaluation.seed)
+        metrics |= simulate_mueller_brown(
+            dataset.train, dataset, force, out_dir, ground_truth_marginals, seed=evaluation.seed
+        )
     elif isinstance(dataset, ALDPDataset):
         inference_bs = BS
         num_samples = (
@@ -729,6 +738,42 @@ def evaluate_toy_samples(
     return {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
 
 
+def mueller_brown_marginals(dataset: MuellerBrownSimulation, n_grid: int = 512) -> tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray]:
+    """Numerically integrate the normalized Müller--Brown density along each axis."""
+    (x_min, x_max), (y_min, y_max) = onp.asarray(dataset.range())
+    x = onp.linspace(x_min, x_max, n_grid)
+    y = onp.linspace(y_min, y_max, n_grid)
+    xx, yy = onp.meshgrid(x, y, indexing="ij")
+    coordinates = jnp.asarray(onp.stack((xx.ravel(), yy.ravel()), axis=1))
+    density = onp.asarray(dataset.likelihood(coordinates)).reshape(n_grid, n_grid)
+    density = density / onp.trapz(onp.trapz(density, y, axis=1), x)
+    return x, onp.trapz(density, y, axis=1), y, onp.trapz(density, x, axis=0)
+
+
+def plot_mueller_brown_marginals(
+    samples: jnp.ndarray,
+    ground_truth_marginals: tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray],
+    sample_label: str,
+    out_path: str,
+) -> None:
+    """Plot analytic marginal densities against empirical marginals from samples."""
+    x, x_density, y, y_density = ground_truth_marginals
+    sample_array = onp.asarray(samples)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), clear=True)
+    for axis, coordinates, truth_density, values, name in (
+        (axes[0], x, x_density, sample_array[:, 0], "x"),
+        (axes[1], y, y_density, sample_array[:, 1], "y"),
+    ):
+        axis.plot(coordinates, truth_density, label="Ground truth", linewidth=2)
+        axis.hist(values, bins=coordinates, density=True, histtype="step", linewidth=2, label=sample_label)
+        axis.set_xlabel(name)
+        axis.set_ylabel("Marginal density")
+        axis.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def evaluate_mueller_brown(
     dataset: MuellerBrownSimulation,
     force_with_features: Callable[[jnp.ndarray], jnp.ndarray],
@@ -769,6 +814,7 @@ def evaluate_mueller_brown_samples(
     score: Callable,
     norm_factor: jnp.ndarray,
     out_dir: str,
+    ground_truth_marginals: tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray],
     seed: int,
 ):
     q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)
@@ -797,6 +843,13 @@ def evaluate_mueller_brown_samples(
     plt.savefig(f"{out_dir}/mueller-brown-iid.pdf", bbox_inches="tight", dpi=DPI)
     plt.close()
 
+    plot_mueller_brown_marginals(
+        q_samples,
+        ground_truth_marginals,
+        "IID samples",
+        f"{out_dir}/mueller-brown-iid-marginals.png",
+    )
+
     rms_fe_sq_error, rms_mjs_error = helper_metrics_2d(
         datapoints.data[:, 0],
         datapoints.data[:, 1],
@@ -818,6 +871,7 @@ def simulate_mueller_brown(
     dataset: MuellerBrownSimulation,
     force: Callable[[jnp.ndarray], jnp.ndarray],
     out_dir: str,
+    ground_truth_marginals: tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray],
     seed: int,
 ):
     key = jax.random.PRNGKey(seed)
@@ -872,6 +926,13 @@ def simulate_mueller_brown(
     dataset.plot(trajectory, cbar_range=(0, 152.5), cbar=False)
     plt.savefig(f"{out_dir}/mueller-brown-langevin.pdf", bbox_inches="tight", dpi=200)
     plt.close()
+
+    plot_mueller_brown_marginals(
+        trajectory,
+        ground_truth_marginals,
+        "Langevin samples",
+        f"{out_dir}/mueller-brown-langevin-marginals.png",
+    )
 
     rms_fe_sq_error, rms_mjs_error = helper_metrics_2d(
         datapoints.data[:, 0],

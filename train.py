@@ -59,8 +59,6 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
         raise TypeError("loss_type='tsm' or 'sc' requires a dataset with a callable force(frame) method.")
 
     sample_shape = tuple(dataset.sample_shape)
-    if len(sample_shape) != 2 or sample_shape[-1] != 3:
-        raise ValueError("loss_type='tsm' or 'sc' requires sample_shape=(n_atoms, 3).")
     if datapoints.data.shape[1] != int(np.prod(sample_shape)):
         raise ValueError("Datapoint coordinate dimension does not match dataset.sample_shape.")
 
@@ -117,7 +115,7 @@ def _prepare_tsm_inputs(
     ]
     if mode_mixture_losses:
         if np.asarray(norm_factor).size != 1:
-            raise ValueError("Full-atom mode-mixture TSM currently requires a scalar coordinate norm_factor.")
+            raise ValueError("Mode-mixture TSM requires a scalar coordinate norm_factor.")
         # Must run before _precompute_forces releases ALDP's retained full frames.
         sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
         sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)

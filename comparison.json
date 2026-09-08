@@ -1,0 +1,13 @@
+{
+    "folders":[
+        "2026-09-06/15-44-01",
+        "2026-09-06/16-27-41", 
+        "2026-09-07/09-13-07"
+    ],
+    "metrics":[
+        "aldp_langevin_phi_psi"
+    ],
+    "extra_col":{
+        "ground truth":"/home/go57nuk/ScoreMD/outputs/aldp/2026-09-06/15-44-01/out/aldp_iid_phi_psi_target.png"
+    }
+}

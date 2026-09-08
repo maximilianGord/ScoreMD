@@ -110,6 +110,7 @@ class TrainingSchedule(abc.ABC):
 
         def merged_loss(
             params: FrozenDict[str, Any],
+            teacher_params: FrozenDict[str, Any],
             key: ArrayLike,
             batch: ArrayLike,
             features: Optional[ArrayLike],
@@ -118,13 +119,13 @@ class TrainingSchedule(abc.ABC):
             is_special_epoch: bool,
         ) -> Tuple[ArrayLike, ArrayLike]:
             # return loss_fns[0](params, key, batch, ts)
-            sum_loss, sum_aux = 0.0, jnp.array([0.0, 0.0, 0.0])
+            sum_loss, sum_aux = 0.0, jnp.zeros(5)
             for (t1, t0), loss_fn in zip(self.training_ranges(), loss_fns):
                 loss_match = jnp.any((ts < t1) & (ts > t0))
                 cur_loss, cur_aux = jax.lax.cond(
                     loss_match,
-                    lambda: loss_fn(params, key, batch, features, forces, ts, is_special_epoch),
-                    lambda: (jnp.sum(jnp.array([0.0])), jnp.array([0.0, 0.0, 0.0])),
+                    lambda: loss_fn(params, teacher_params, key, batch, features, forces, ts, is_special_epoch),
+                    lambda: (jnp.sum(jnp.zeros(5)), jnp.zeros(5)),
                 )
 
                 sum_loss += loss_match * cur_loss
@@ -148,10 +149,10 @@ class TrainingSchedule(abc.ABC):
         key: ArrayLike,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
-            _, loss = loss_fn(state.params, key, batch, features, forces, ts, is_special_epoch, False)
+            _, loss = loss_fn(state.params, state.ema_params, key, batch, features, forces, ts, is_special_epoch, False)
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, key, batch, features, forces, ts, is_special_epoch, True
+            state.params, state.ema_params, key, batch, features, forces, ts, is_special_epoch, True
         )
 
         state = state.apply_gradients(grads=grads)
@@ -245,9 +246,7 @@ class TrainingSchedule(abc.ABC):
         (_, state), losses = jax.lax.scan(train_step_scan, (key, state), perms)
         losses = jnp.array(losses)
 
-        # apply SEMA https://arxiv.org/abs/2402.09240, similar to https://arxiv.org/abs/2312.07551
-        state = state.replace(params=state.ema_params)
-
+        # Keep the optimized student parameters separate from the EMA teacher.
         return state, losses
 
     def _train_n_epochs(
@@ -411,12 +410,16 @@ class AllAtOnce(TrainingSchedule):
             f"{prefix}diffusion_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
             f"{prefix}vector_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
             f"{prefix}scalar_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}tsm_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[3],
+            f"{prefix}sc_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[4],
         }
 
         info |= {f"{prefix}loss_{i}": jnp.mean(loss, axis=0)[i].sum() for i in range(loss.shape[1])}
         info |= {f"{prefix}diffusion_loss_{i}": jnp.mean(loss, axis=0)[i][0] for i in range(loss.shape[1])}
         info |= {f"{prefix}vector_fp_loss_{i}": jnp.mean(loss, axis=0)[i][1] for i in range(loss.shape[1])}
         info |= {f"{prefix}scalar_fp_loss_{i}": jnp.mean(loss, axis=0)[i][2] for i in range(loss.shape[1])}
+        info |= {f"{prefix}tsm_loss_{i}": jnp.mean(loss, axis=0)[i][3] for i in range(loss.shape[1])}
+        info |= {f"{prefix}sc_loss_{i}": jnp.mean(loss, axis=0)[i][4] for i in range(loss.shape[1])}
 
         return info
 
@@ -671,6 +674,8 @@ class OneAfterAnother(TrainingSchedule):
             f"{prefix}diffusion_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
             f"{prefix}vector_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
             f"{prefix}scalar_fp_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}tsm_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[3],
+            f"{prefix}sc_loss": jnp.sum(jnp.mean(loss, axis=0), axis=0)[4],
         }
 
         info |= {
@@ -678,6 +683,8 @@ class OneAfterAnother(TrainingSchedule):
             f"{prefix}diffusion_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[0],
             f"{prefix}vector_fp_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[1],
             f"{prefix}scalar_fp_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[2],
+            f"{prefix}tsm_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[3],
+            f"{prefix}sc_loss_{idx}": jnp.sum(jnp.mean(loss, axis=0), axis=0)[4],
         }
 
         return info

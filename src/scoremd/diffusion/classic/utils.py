@@ -82,6 +82,10 @@ def get_loss(
     tsm_lambda: float = 1.0,
     tsm_t0: float = 0.05,
     tsm_sigma_max: float = 0.01,
+    sg_type: str = "constant",
+    sg_lambda: float = 1.0,
+    sg_t0: float = 0.05,
+    sg_sigma_max: float = 0.01,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     kbT: float = 1.0,
@@ -104,30 +108,26 @@ def get_loss(
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
     """
-    if loss_type not in ("dsm", "tsm"):
-        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm' or 'tsm'.")
-    if loss_type == "tsm" and tsm_type not in (
-        "constant",
-        "hard_cutoff",
-        "smooth_decay",
-        "linear",
-        "linear_decay",
-        "noise_cutoff",
-        "mode_mixture",
-    ):
+    if loss_type not in ("dsm", "tsm", "sc"):
+        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', or 'sc'.")
+    valid_matching_types = ("constant", "hard_cutoff", "smooth_decay", "linear", "linear_decay", "noise_cutoff", "mode_mixture")
+    if loss_type == "tsm" and tsm_type not in valid_matching_types:
         raise ValueError(f"Unknown tsm_type={tsm_type!r}.")
-
+    if loss_type == "sc" and sg_type not in valid_matching_types:
+        raise ValueError(f"Unknown sg_type={sg_type!r}.")
     log.info("Using VP-SDE")
     from scoremd.diffusion.classic.sde import VP
-    from scoremd.diffusion.tsm import tsm_loss
+    from scoremd.diffusion.tsm import semigroup_consistency_loss, tsm_loss
 
     sde = VP()
     from scoremd.diffusion.fp import fp_vp_loss
 
     reduce_op = jnp.mean if reduce_mean else lambda *args, **kwargs: 0.5 * jnp.sum(*args, **kwargs)
+    time_weighting_sg = lambda _s, t: time_weighting(t)
 
     def loss(
         params: FrozenDict[str, Any],
+        teacher_params: FrozenDict[str, Any],
         rng: ArrayLike,
         batch: ArrayLike,
         features: Optional[ArrayLike],
@@ -138,11 +138,12 @@ def get_loss(
     ) -> Sequence[ArrayLike]:
         rng, error_rng, dropout_rng = jax.random.split(rng, 3)
         score_fn = get_score(model, params, training, evaluated_models, rngs={"dropout": dropout_rng})
+        teacher_score_fn = get_score(model, teacher_params, False, evaluated_models)
 
         perturbed_data, perturbed_noise, std = perturb(ts, sde, error_rng, batch)
 
         score = None
-        vector_fp, scalar_fp = 0, 0
+        vector_fp, scalar_fp, tsm_component, sc_loss = 0, 0, 0, 0
         if is_special_epoch:
             min_alpha_beta = 1e-6
             if alpha > min_alpha_beta or beta > min_alpha_beta:
@@ -298,7 +299,11 @@ def get_loss(
                     kbT=kbT,
                     reduce=reduce_op,
                 )
-                combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
+                #combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
+                weighted_losses = losses*kappas*lambdas
+                weighted_target_score_losses = target_score_losses*(1-kappas)
+                diffusion_loss = reduce_op(weighted_losses)
+                tsm_component = reduce_op(weighted_target_score_losses)
             else:
                 target_score_losses, _, _ = tsm_loss(
                     error_rng,
@@ -318,10 +323,88 @@ def get_loss(
                     kbT=kbT,
                     reduce=reduce_op,
                 )
-                combined_per_sample = losses + target_score_losses
-            diffusion_loss = reduce_op(combined_per_sample)
+                #combined_per_sample = losses + target_score_losses
+                diffusion_loss = reduce_op(losses)
+                tsm_component = reduce_op(target_score_losses)
+        if loss_type == "sc":
+            if forces is None:
+                raise ValueError("loss_type='sc' requires precomputed per-sample forces for the force anchor.")
+            if score_fn is None:
+                raise ValueError("loss_type='sc' requires an EMA teacher score function.")
+            # TODO : Change the hardcoded t_0 = 0
+            t0 = jnp.zeros_like(ts)
+            score_at_0 = score_fn(batch, features, t0)
+            force_anchor_losses, _, _ = tsm_loss(
+                error_rng,
+                sde,
+                score_at_0,
+                batch,
+                forces,
+                features,
+                t0,
+                time_weighting,
+                "constant",   # L_force,0 is an unconditional anchor, not schedule-weighted
+                1.0,          # tsm_lambda: weighting is applied by the caller via lambda_0
+                tsm_t0,
+                tsm_sigma_max,
+                sigma_data=sigma_data,
+                sigma_mode_sq=sigma_mode_sq,
+                kbT=kbT,
+                reduce=reduce_op,
+            )
+            tsm_component = reduce_op(force_anchor_losses)
 
-        return gamma * diffusion_loss, vector_fp, scalar_fp
+            s_rng, posterior_rng = jax.random.split(error_rng)
+            #TODO change hard coded t_min to a parameter
+            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6)
+            r_s = _vp_posterior_sample(posterior_rng, sde, batch, perturbed_data, s_vals, ts)
+            teacher_score = teacher_score_fn(r_s, features, s_vals)
+
+            if sg_type == "mode_mixture":
+                sc_per_sample, kappas_sg, lambdas_sg = semigroup_consistency_loss(
+                    error_rng,
+                    sde,
+                    score,
+                    teacher_score,
+                    perturbed_data,
+                    s_vals,
+                    ts,
+                    time_weighting_sg,
+                    sg_type,
+                    sg_lambda,
+                    sg_t0,
+                    sg_sigma_max,
+                    sigma_data=sigma_data,
+                    sigma_mode_sq=sigma_mode_sq,
+                    reduce=reduce_op,
+                )
+                weighted_losses = sc_per_sample*kappas_sg
+                weighted_consistent_semigroup_losses = sc_per_sample*(1-kappas_sg)
+                sc_loss = reduce_op(weighted_consistent_semigroup_losses)
+                diffusion_loss = reduce_op(weighted_losses)
+
+            else:
+                sc_per_sample, gammas_sg = semigroup_consistency_loss(
+                    error_rng,
+                    sde,
+                    score,
+                    teacher_score,
+                    perturbed_data,
+                    s_vals,
+                    ts,
+                    time_weighting_sg,
+                    sg_type,
+                    sg_lambda,
+                    sg_t0,
+                    sg_sigma_max,
+                    sigma_data=sigma_data,
+                    sigma_mode_sq=sigma_mode_sq,
+                    reduce=reduce_op,
+                )
+                sc_loss = reduce_op(sc_per_sample)
+                diffusion_loss = reduce_op(losses)
+
+        return gamma * diffusion_loss, vector_fp, scalar_fp, tsm_component, sc_loss
 
     return loss
 
@@ -537,3 +620,40 @@ def get_sampler(
 
     # return jax.pmap(sampler, in_axes=(0), axis_name='batch')
     return sampler
+
+def _vp_posterior_sample(
+    rng: jax.random.PRNGKey,
+    sde: Any,
+    x0: jnp.ndarray,
+    x_t: jnp.ndarray,
+    s: jnp.ndarray,
+    t: jnp.ndarray,
+) -> jnp.ndarray:
+    """Sample R_s ~ q(R_s | R_t, x0), Markov-coupled to the _vp_posterior_samplegiven R_t."""
+    alpha_s = jnp.exp(sde.log_mean_coeff(s))
+    a_t_given_s = jnp.exp(sde.log_mean_coeff(t) - sde.log_mean_coeff(s))
+
+    sigma_s_sq = sde.variance(s)
+    sigma_t_sq = jnp.maximum(sde.variance(t), 1e-12)
+    b_sq_t_given_s = jnp.maximum(sigma_t_sq - jnp.square(a_t_given_s) * sigma_s_sq, 1e-12)
+
+    coeff_xt = a_t_given_s * sigma_s_sq / sigma_t_sq
+    coeff_x0 = alpha_s * (1.0 - jnp.square(a_t_given_s) * sigma_s_sq / sigma_t_sq)
+    mean = batch_mul(coeff_xt, x_t) + batch_mul(coeff_x0, x0)
+
+    posterior_std = jnp.sqrt(sigma_s_sq * b_sq_t_given_s / sigma_t_sq)
+    noise = jax.random.normal(rng, shape=x_t.shape, dtype=x_t.dtype)
+    return mean + batch_mul(posterior_std, noise)
+
+def _sample_s_before_t(
+    rng: jax.random.PRNGKey,
+    t: jnp.ndarray,
+    t_min: float,
+) -> jnp.ndarray:
+    """Sample s ~ Uniform(t_min, t) elementwise, strictly below each t.
+
+    Requires t > t_min elementwise (guaranteed if t_min matches whatever
+    lower bound was used to sample t itself upstream).
+    """
+    u = jax.random.uniform(rng, shape=t.shape, dtype=t.dtype)
+    return t_min + u * (t - t_min)

@@ -220,16 +220,23 @@ def compute_sigma_mode(
 
 
 def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict[str, float | int]]:
-    """Estimate physical ``sigma_mode_sq`` from a full-atom ScoreMD dataset.
+    """Estimate physical ``sigma_mode_sq`` from full coordinates when a dataset provides them.
 
-    The dataset must expose full-atom ``train.data``, ``sample_shape``,
-    ``kbT``, and ``force(frame)``.  The returned value is in nm² and must be
-    multiplied by ``norm_factor**2`` before use by a normalized score model.
+    Coarse-grained ALDP datasets retain paired full-atom frames exclusively for
+    force-related preprocessing.  Use those frames here so OpenMM still sees
+    the 22-atom configuration while the resulting scalar can be used by the
+    CG loss.  Other datasets fall back to their training coordinates.
     """
     sample_shape = tuple(dataset.sample_shape)
     if len(sample_shape) != 2 or sample_shape[-1] != 3:
-        raise ValueError("Full-atom sigma-mode estimation requires dataset.sample_shape = (n_atoms, 3).")
+        raise ValueError("Sigma-mode estimation requires dataset.sample_shape = (n_atoms, 3).")
     if not hasattr(dataset, "force") or not callable(dataset.force):
         raise TypeError("Dataset must provide a callable force(frame) for Hessian estimation.")
-    frames = np.asarray(dataset.train.data, dtype=float).reshape((-1, *sample_shape))
+
+    datapoints = dataset.train
+    full_coordinates = (
+        dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
+    )
+    coordinate_source = full_coordinates if full_coordinates is not None else datapoints.data
+    frames = np.asarray(coordinate_source, dtype=float).reshape((len(datapoints), -1, 3))
     return compute_sigma_mode(frames, dataset.force, beta=1.0 / float(dataset.kbT), **kwargs)

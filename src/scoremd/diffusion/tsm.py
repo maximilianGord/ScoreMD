@@ -6,6 +6,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
+from scoremd.utils.diffusion import batch_mul
+
 if TYPE_CHECKING:
     import scoremd.diffusion.classic.sde as sdes
 
@@ -136,6 +138,85 @@ def tsm_loss(
     weighted_loss = time_weights * gamma_t * loss_per_sample
     return weighted_loss, None, None
 
+def semigroup_consistency_loss(
+    key: jax.random.PRNGKey,
+    sde: sdes.VP,
+    score: ArrayLike,
+    teacher_score: ArrayLike,
+    x_t: ArrayLike,
+    s: ArrayLike,
+    t: ArrayLike,
+    time_weighting: Callable[[ArrayLike, ArrayLike], ArrayLike],
+    sg_type: str,
+    sg_lambda: float,
+    sg_t0: float,
+    sg_sigma_max: float,
+    sigma_data: float = 1.0,
+    sigma_mode_sq: Optional[float] = None,
+    reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
+) -> tuple[ArrayLike, ArrayLike]:
+    """Compute the score-semigroup consistency loss L_SG.
 
+    ``score`` is the student score s_theta(R_t, t) and ``teacher_score`` is
+    the EMA teacher score s_bar_theta(R_s, s), evaluated on a Markov-coupled
+    pair (R_s, R_t) with 0 <= s < t. ``x_t`` is R_t, used only for shape
+    validation. The teacher target is stop-gradiented here regardless of
+    whether the caller already did so.
+
+    This term is the exact TSM identity from the semigroup relation
+
+        s_t(y) = (1 / a_{t|s}) * E[s_s(R_s) | R_t = y],
+
+    with s playing the role ordinarily played by t=0 and the s->t kernel
+    (a_{t|s}, b_{t|s}) playing the role ordinarily played by (alpha_t,
+    sigma_t). Consequently the ``mode_mixture`` weighting scheme reuses
+    ``_optimal_tsm_lambda`` unchanged, substituting (a_{t|s}, b_{t|s}^2) for
+    (alpha_t, sigma_t^2).
+
+    For regular schedules, this returns ``(loss, gamma_st)`` where
+    ``gamma_st`` is the configured weight. For ``mode_mixture``, it returns
+    ``(loss, kappa_st, lambda_st)``. Pairs with s >= t are masked to nan so
+    that ``jnp.nanmean``-style reduction upstream ignores them.
+    """
+    del key
+
+    x_t = jnp.asarray(x_t)
+    s = jnp.broadcast_to(jnp.asarray(s, dtype=x_t.dtype).reshape(-1), (x_t.shape[0],))
+    t = jnp.broadcast_to(jnp.asarray(t, dtype=x_t.dtype).reshape(-1), (x_t.shape[0],))
+
+    score = jnp.asarray(score, dtype=x_t.dtype)
+    teacher_score = jax.lax.stop_gradient(jnp.asarray(teacher_score, dtype=x_t.dtype))
+    if score.shape != x_t.shape or teacher_score.shape != x_t.shape:
+        raise ValueError("score and teacher_score must match x_t's shape.")
+
+    valid = s < t
+
+    a_t_given_s = jnp.exp(sde.log_mean_coeff(t) - sde.log_mean_coeff(s))
+    sigma_s_sq = sde.variance(s)
+    sigma_t_sq = jnp.maximum(sde.variance(t), 1e-12)
+    b_sq_t_given_s = jnp.maximum(sigma_t_sq - jnp.square(a_t_given_s) * sigma_s_sq, 1e-12)
+
+    target_score = batch_mul(1.0 / a_t_given_s, teacher_score)
+    squared_error = jnp.square(score - target_score).reshape((x_t.shape[0], -1))
+    loss_per_sample = jnp.mean(squared_error, axis=-1)
+    time_weights = time_weighting(s, t)
+
+    if sg_type == "mode_mixture":
+        sigma_data_sq = (
+            jnp.asarray(sigma_mode_sq, dtype=x_t.dtype)
+            if sigma_mode_sq is not None
+            else jnp.square(jnp.asarray(sigma_data, dtype=x_t.dtype))
+        )
+        kappa_st = b_sq_t_given_s / jnp.maximum(
+            b_sq_t_given_s + jnp.square(a_t_given_s) * sigma_data_sq, 1e-12
+        )
+        lambda_st = _optimal_tsm_lambda(b_sq_t_given_s, sigma_data_sq)
+        weighted_loss = jnp.where(valid, time_weights * lambda_st * loss_per_sample, jnp.nan)
+        return weighted_loss, kappa_st, lambda_st
+
+    sigma_t = sde.std(t)
+    gamma_st = tsm_weight(t, sigma_t, sg_type, sg_lambda, sg_t0, sg_sigma_max)
+    weighted_loss = jnp.where(valid, time_weights * gamma_st * loss_per_sample, jnp.nan)
+    return weighted_loss, gamma_st
 
 __all__ = ["tsm_loss"]

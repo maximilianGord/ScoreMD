@@ -121,7 +121,7 @@ class EmaTrainState(struct.PyTreeNode):
             # Since this function is called for each 'module' in the params tree, it handles frozen parameters.
             return jnp.where(
                 (jnp.abs(new_param - old_param) > 1e-8).any(),
-                self.ema_weight * new_param + (1 - self.ema_weight) * ema_param,
+                self.ema_weight * ema_param + (1 - self.ema_weight) * new_param,
                 ema_param,
             )
 

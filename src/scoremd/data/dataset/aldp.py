@@ -58,6 +58,8 @@ class ALDPDataset(Dataset):
         self.seed = seed
         self._dataset = None
         self._path = path
+        self._train_force_coordinates = None
+        self._val_force_coordinates = None
 
         root = get_persistent_storage()
         try:
@@ -107,46 +109,91 @@ class ALDPDataset(Dataset):
             kbT=(unit.MOLAR_GAS_CONSTANT_R * temp).value_in_unit(unit.kilojoules_per_mole),
         )
 
-    def _split_data(self, data: jnp.ndarray, key) -> Tuple[jnp.ndarray, Optional[jnp.ndarray], Optional[jnp.ndarray]]:
-        if key is not None:
-            data = jax.random.permutation(key, data)
-
+    def _split_indices(self, num_samples: int, key: jnp.ndarray) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+        indices = jax.random.permutation(key, num_samples)
         if self.validation:
-            train_set = round(len(data) * self.train_split)
+            train_set = round(num_samples * self.train_split)
             assert train_set > 0, "No training samples."
-
-            train, val = data[:train_set], data[train_set:]
+            train_indices, val_indices = indices[:train_set], indices[train_set:]
         else:
-            train, val = data, data[:0]
+            train_indices, val_indices = indices, indices[:0]
 
         if self.limit_samples:
-            new_train_set_size = min(train.shape[0], self.limit_samples)
+            new_train_set_size = min(train_indices.shape[0], self.limit_samples)
             new_val_set_size = int(jnp.ceil(new_train_set_size / self.train_split * (1 - self.train_split)))
-
             log.info(
                 f"Limit samples has been set to: {self.limit_samples}. "
                 f"Limiting training dataset to {new_train_set_size} and validation set to {new_val_set_size} sample(s)."
             )
-            train = train[:new_train_set_size]
-            val = val[:new_val_set_size]
+            train_indices = train_indices[:new_train_set_size]
+            val_indices = val_indices[:new_val_set_size]
 
-        return train, val if val.shape[0] > 0 else None
+        return train_indices, val_indices if val_indices.shape[0] > 0 else None
+
+    @staticmethod
+    def _align_full_coordinates(
+        full_coordinates: onp.ndarray, coarse_coordinates: jnp.ndarray, rotations: jnp.ndarray
+    ) -> onp.ndarray:
+        """Apply the CG Kabsch centering and rotation to matching full-atom frames."""
+        coarse_coordinates = onp.asarray(coarse_coordinates).reshape((-1, coarse_coordinates.shape[-1] // 3, 3))
+        full_coordinates = onp.asarray(full_coordinates).reshape((-1, 22, 3))
+        centered_full_coordinates = full_coordinates - onp.mean(coarse_coordinates, axis=1, keepdims=True)
+        aligned = onp.matmul(centered_full_coordinates, onp.swapaxes(onp.asarray(rotations), -1, -2))
+        return aligned.reshape((aligned.shape[0], -1))
+
+    def force_coordinates_for(self, datapoints: Datapoints) -> Optional[onp.ndarray]:
+        """Return full-atom coordinates for one-time projected-force evaluation."""
+        force_coordinates = None
+        if datapoints is self._train:
+            force_coordinates = self._train_force_coordinates
+        elif datapoints is self._val:
+            force_coordinates = self._val_force_coordinates
+        if force_coordinates is None and self.coarse_graining_level != CoarseGrainingLevel.NONE:
+            raise ValueError(
+                "Projected TSM/SC forces require paired full-atom ALDP coordinates; "
+                "a custom coarse-grained path cannot provide them."
+            )
+        return force_coordinates
+
+    def release_force_coordinates(self, datapoints: Datapoints) -> None:
+        """Discard full-atom coordinates once their projected force targets are materialized."""
+        if datapoints is self._train:
+            self._train_force_coordinates = None
+        elif datapoints is self._val:
+            self._val_force_coordinates = None
+
+    def project_forces(self, full_forces: jnp.ndarray) -> jnp.ndarray:
+        """Project 22-atom OpenMM forces onto the atoms represented by this dataset."""
+        full_forces = jnp.asarray(full_forces).reshape((-1, 3))
+        if full_forces.shape[0] != 22:
+            raise ValueError(f"Expected forces for 22 atoms, got {full_forces.shape[0]}.")
+        return full_forces[jnp.asarray(self._atoms_to_keep, dtype=jnp.int32)].reshape(-1)
 
     def _get_data(self) -> Tuple[Datapoints, Optional[Datapoints], Optional[Datapoints]]:
+        full_coordinates = None
         if self._path is not None:
-            data = onp.load(self._path)
-            data = jnp.array(data)
-            assert data.shape[1] == len(self._atoms_to_keep), "Invalid number of atoms"
+            coarse_coordinates = jnp.asarray(onp.load(self._path))
+            assert coarse_coordinates.shape[1] == len(self._atoms_to_keep), "Invalid number of atoms"
         else:
-            data = jnp.array(self._dataset.xyz)
-            data = data[:, self._atoms_to_keep, ...]
+            full_coordinates = onp.asarray(self._dataset.xyz)
+            coarse_coordinates = jnp.asarray(full_coordinates[:, self._atoms_to_keep, ...])
 
-        data = data.reshape(data.shape[0], -1)
-        train, val = self._split_data(data, jax.random.PRNGKey(self.seed))
+        train_indices, val_indices = self._split_indices(coarse_coordinates.shape[0], jax.random.PRNGKey(self.seed))
+        train_unaligned = coarse_coordinates[train_indices].reshape((train_indices.shape[0], -1))
+        train, _, train_rotations = kabsch_align_many(train_unaligned, train_unaligned[0], return_rotation=True)
+        if full_coordinates is not None:
+            self._train_force_coordinates = self._align_full_coordinates(
+                full_coordinates[onp.asarray(train_indices)], train_unaligned, train_rotations
+            )
 
-        train, _ = kabsch_align_many(train, train[0])
-        if val is not None:
-            val, _ = kabsch_align_many(val, train[0])
+        val = None
+        if val_indices is not None:
+            val_unaligned = coarse_coordinates[val_indices].reshape((val_indices.shape[0], -1))
+            val, _, val_rotations = kabsch_align_many(val_unaligned, train[0], return_rotation=True)
+            if full_coordinates is not None:
+                self._val_force_coordinates = self._align_full_coordinates(
+                    full_coordinates[onp.asarray(val_indices)], val_unaligned, val_rotations
+                )
 
         return Datapoints(train, None), Datapoints(val, None) if val is not None else None, None
 

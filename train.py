@@ -56,25 +56,34 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     if datapoints is None or datapoints.forces is not None:
         return datapoints
     if not hasattr(dataset, "force") or not callable(dataset.force):
-        raise TypeError("loss_type='tsm' requires a dataset with a callable force(frame) method.")
+        raise TypeError("loss_type='tsm' or 'sc' requires a dataset with a callable force(frame) method.")
 
     sample_shape = tuple(dataset.sample_shape)
     if len(sample_shape) != 2 or sample_shape[-1] != 3:
-        raise ValueError("loss_type='tsm' currently supports only full-atom datasets with sample_shape=(n_atoms, 3).")
+        raise ValueError("loss_type='tsm' or 'sc' requires sample_shape=(n_atoms, 3).")
     if datapoints.data.shape[1] != int(np.prod(sample_shape)):
-        raise ValueError(
-            "Datapoint coordinate dimension does not match dataset.sample_shape; "
-            "cannot prepare full-atom TSM forces."
-        )
+        raise ValueError("Datapoint coordinate dimension does not match dataset.sample_shape.")
 
-    frames = np.asarray(datapoints.data).reshape((-1, *sample_shape))
-    forces = np.empty_like(frames)
-    log.info("Precomputing physical forces for %d TSM samples.", len(frames))
-    for index, frame in enumerate(frames):
-        force = np.asarray(dataset.force(jnp.asarray(frame)), dtype=frames.dtype)
-        if force.shape != frame.shape:
-            raise ValueError(f"dataset.force returned {force.shape}; expected {frame.shape}.")
+    target_frames = np.asarray(datapoints.data).reshape((-1, *sample_shape))
+    force_coordinates = (
+        dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
+    )
+    force_frames = (
+        np.asarray(force_coordinates).reshape((len(datapoints), -1, 3))
+        if force_coordinates is not None
+        else target_frames
+    )
+    forces = np.empty_like(target_frames)
+    log.info("Precomputing physical forces for %d TSM/SC samples.", len(target_frames))
+    for index, (target_frame, force_frame) in enumerate(zip(target_frames, force_frames)):
+        force = np.asarray(dataset.force(jnp.asarray(force_frame)), dtype=target_frames.dtype)
+        if force.shape != target_frame.shape:
+            if not hasattr(dataset, "project_forces"):
+                raise ValueError(f"dataset.force returned {force.shape}; expected {target_frame.shape}.")
+            force = np.asarray(dataset.project_forces(force), dtype=target_frames.dtype).reshape(target_frame.shape)
         forces[index] = force
+    if hasattr(dataset, "release_force_coordinates"):
+        dataset.release_force_coordinates(datapoints)
     return datapoints.replace(forces=jnp.asarray(forces.reshape(datapoints.data.shape)))
 
 
@@ -85,28 +94,46 @@ def _prepare_tsm_inputs(
     val_data: Optional[Datapoints],
     norm_factor: jnp.ndarray,
 ) -> tuple[Datapoints, Optional[Datapoints]]:
-    """Prepare static TSM inputs once, before the JIT-compiled training loop."""
-    tsm_losses = [loss for loss in training_schedule.losses if _loss_options(loss).get("loss_type", "dsm") == "tsm"]
-    if not tsm_losses:
+    """Prepare static TSM/SC inputs once, before the JIT-compiled training loop."""
+    force_losses = [
+        loss
+        for loss in training_schedule.losses
+        if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc")
+    ]
+    if not force_losses:
         return train_data, val_data
+
+    mode_mixture_losses = [
+        loss
+        for loss in force_losses
+        if (
+            _loss_options(loss).get("loss_type") == "tsm"
+            and _loss_options(loss).get("tsm_type") == "mode_mixture"
+        )
+        or (
+            _loss_options(loss).get("loss_type") == "sc"
+            and _loss_options(loss).get("sg_type", "constant") == "mode_mixture"
+        )
+    ]
+    if mode_mixture_losses:
+        if np.asarray(norm_factor).size != 1:
+            raise ValueError("Full-atom mode-mixture TSM currently requires a scalar coordinate norm_factor.")
+        # Must run before _precompute_forces releases ALDP's retained full frames.
+        sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
+        sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
+        log.info(
+            "Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; diagnostics=%s",
+            sigma_mode_sq,
+            sigma_mode_sq_normalized,
+            diagnostics,
+        )
+        for ranged_loss in mode_mixture_losses:
+            _set_runtime_loss_options(ranged_loss, sigma_mode_sq=sigma_mode_sq_normalized, kbT=float(dataset.kbT))
 
     train_data = _precompute_forces(dataset, train_data)
     val_data = _precompute_forces(dataset, val_data)
-    for ranged_loss in tsm_losses:
+    for ranged_loss in force_losses:
         _set_runtime_loss_options(ranged_loss, kbT=float(dataset.kbT))
-
-    mode_mixture_losses = [loss for loss in tsm_losses if _loss_options(loss).get("tsm_type") == "mode_mixture"]
-    if not mode_mixture_losses:
-        return train_data, val_data
-    if np.asarray(norm_factor).size != 1:
-        raise ValueError("Full-atom mode-mixture TSM currently requires a scalar coordinate norm_factor.")
-
-    sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
-    sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
-    log.info("Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; diagnostics=%s", sigma_mode_sq,
-             sigma_mode_sq_normalized, diagnostics)
-    for ranged_loss in mode_mixture_losses:
-        _set_runtime_loss_options(ranged_loss, sigma_mode_sq=sigma_mode_sq_normalized, kbT=float(dataset.kbT))
     return train_data, val_data
 
 
@@ -173,20 +200,6 @@ def training_routine(
         )
 
     BS = training_schedule.BS
-    if BS > train_data.data.shape[0]:
-        # replicate the training data to match the batch size
-        log.warning(
-            f"Batch size is larger than the dataset size. "
-            f"To prevent errors, we increase the training data from {train_data.data.shape[0]} to {BS}."
-        )
-
-        new_train_data = jnp.concatenate([train_data.data] * BS, axis=0)[:BS]
-        new_train_features = (
-            None
-            if train_data.features is None
-            else jnp.concatenate([train_data.features] * BS, axis=0, dtype=train_data.features.dtype)[:BS]
-        )
-        train_data = train_data.replace(data=new_train_data, features=new_train_features)
 
     ranged_models = sorted(ranged_models, key=lambda x: x.range[0], reverse=True)
     log.info(f"Specified {len(ranged_models)} model(s) with range(s) {' -> '.join([str(m) for m in ranged_models])}")
@@ -228,12 +241,29 @@ def training_routine(
         else:
             num_devices = jax.device_count()
             log.info(f"num_devices not specified, using all {num_devices} devices")
-    else:
-        if num_devices > jax.device_count():
-            raise ValueError(
-                f"Number of devices ({num_devices}) must be less than or equal to the number of available devices ({jax.device_count()})"
-            )
+    elif num_devices > jax.device_count():
+        raise ValueError(
+            f"Number of devices ({num_devices}) must be less than or equal to the number of available devices ({jax.device_count()})"
+        )
 
+    if BS > train_data.data.shape[0]:
+        # Replicate coordinates, features, and precomputed projected forces together.
+        log.warning(
+            f"Batch size is larger than the dataset size. "
+            f"To prevent errors, we increase the training data from {train_data.data.shape[0]} to {BS}."
+        )
+        new_train_data = jnp.concatenate([train_data.data] * BS, axis=0)[:BS]
+        new_train_features = (
+            None
+            if train_data.features is None
+            else jnp.concatenate([train_data.features] * BS, axis=0, dtype=train_data.features.dtype)[:BS]
+        )
+        new_train_forces = (
+            None
+            if train_data.forces is None
+            else jnp.concatenate([train_data.forces] * BS, axis=0, dtype=train_data.forces.dtype)[:BS]
+        )
+        train_data = train_data.replace(data=new_train_data, features=new_train_features, forces=new_train_forces)
     if training_schedule.BS % num_devices != 0:
         raise ValueError(f"Batch size ({training_schedule.BS}) must be divisible by number of devices ({num_devices})")
 
@@ -294,7 +324,12 @@ def training_routine(
         plt.savefig(f"{out_dir}/{filename}.png", bbox_inches="tight")
         plt.close()
 
-        for i, (loss, title) in enumerate(zip(losses.T, ["Diffusion Loss", "Vector FP Loss", "Scalar FP Loss"])):
+        for i, (loss, title) in enumerate(
+            zip(
+                losses.T,
+                ["Diffusion Loss", "Vector FP Loss", "Scalar FP Loss", "TSM Loss", "SC Loss"],
+            )
+        ):
             if jnp.any(jnp.abs(loss) > 1e-6):
                 plt.figure(clear=True)
                 plt.title(f"{prefix} - {title}")

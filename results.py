@@ -158,9 +158,10 @@ def main() -> None:
     _, csv_details, csv_metrics = map(list, zip(*csv_run_data))
     write_csv(csv_details, csv_metrics)
 
-    image_run_data = [run_details(folder) for folder in folders]
-    image_run_dirs, image_details, _ = map(list, zip(*image_run_data))
-    write_comparison_image(image_run_dirs, image_details, image_metrics, extra_columns)
+    if folders and image_metrics:
+        image_run_data = [run_details(folder) for folder in folders]
+        image_run_dirs, image_details, _ = map(list, zip(*image_run_data))
+        write_comparison_image(image_run_dirs, image_details, image_metrics, extra_columns)
 
 
 if __name__ == "__main__":

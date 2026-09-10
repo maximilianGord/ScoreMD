@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from os import PathLike
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, Literal
 from scoremd.data.dataset import Dataset
 import jax
 import jax.numpy as jnp
@@ -41,6 +41,7 @@ class ALDPDataset(Dataset):
     test: bool = False
     path: Optional[PathLike] = None  # Can be used to load a custom dataset
     seed: int = 0
+    mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance"] = "data_hessian"
 
     def __init__(
         self,
@@ -50,12 +51,19 @@ class ALDPDataset(Dataset):
         limit_samples: Optional[int] = None,
         validation: bool = True,
         seed: int = 0,
+        mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance"] = "data_hessian",
         name="aldp",
     ):
+        if mode_var_computation not in {"data_hessian", "data_empirical", "cg_local_covariance"}:
+            raise ValueError(
+                "mode_var_computation must be 'data_hessian', 'data_empirical', or "
+                f"'cg_local_covariance'; got {mode_var_computation!r}."
+            )
         self.train_split = train_split
         self.limit_samples = limit_samples
         self.validation = validation
         self.seed = seed
+        self.mode_var_computation = mode_var_computation
         self._dataset = None
         self._path = path
         self._train_force_coordinates = None

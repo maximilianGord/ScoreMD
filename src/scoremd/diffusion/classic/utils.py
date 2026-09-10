@@ -378,8 +378,12 @@ def get_loss(
                     sigma_mode_sq=sigma_mode_sq,
                     reduce=reduce_op,
                 )
-                weighted_losses = sc_per_sample*kappas_sg
-                weighted_consistent_semigroup_losses = sc_per_sample*(1-kappas_sg)
+                # Match the TSM mode-mixture objective: DSM and semigroup
+                # consistency are complementary estimators, mixed by kappa.
+                # ``sc_per_sample`` already contains lambda_st, whereas
+                # ``losses`` only contains the ordinary time weighting.
+                weighted_losses = losses * kappas_sg * lambdas_sg
+                weighted_consistent_semigroup_losses = sc_per_sample * (1 - kappas_sg)
                 sc_loss = reduce_op(weighted_consistent_semigroup_losses)
                 diffusion_loss = reduce_op(weighted_losses)
 

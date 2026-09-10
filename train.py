@@ -22,7 +22,7 @@ import scoremd.models as diffusion_models
 import wandb as wandb_lib
 from scoremd.data.dataset import ToyDataset, Dataset, MuellerBrownSimulation
 from scoremd.data.dataset.base import Datapoints
-from scoremd.data.dataset.utils import compute_full_atom_sigma_mode
+from scoremd.data.dataset.utils import compute_cg_local_sigma_mode, compute_full_atom_sigma_mode
 from scoremd.models.mixture import MixtureOfModels
 from scoremd.training import load_and_train, TrainingSchedule
 from scoremd.training.train_state import EmaTrainState
@@ -117,12 +117,35 @@ def _prepare_tsm_inputs(
         if np.asarray(norm_factor).size != 1:
             raise ValueError("Mode-mixture TSM requires a scalar coordinate norm_factor.")
         # Must run before _precompute_forces releases ALDP's retained full frames.
-        sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
+        mode_var_computation = getattr(dataset, "mode_var_computation", "data_hessian")
+        if mode_var_computation == "potential":
+            if not isinstance(dataset, MuellerBrownSimulation):
+                raise ValueError("dataset.mode_var_computation=potential is only supported for Müller-Brown.")
+            sigma_mode_sq = dataset.sigma_mode_sq_from_potential()
+            diagnostics = {"source": "potential", "mode": "global_minimum"}
+        elif mode_var_computation == "data_hessian":
+            sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
+        elif mode_var_computation == "data_empirical":
+            from scoremd.data.dataset.utils import compute_empirical_sigma_mode
+
+            sigma_mode_sq = compute_empirical_sigma_mode(dataset)
+            diagnostics = {"source": "data", "estimator": "centered_empirical_variance"}
+        elif mode_var_computation == "cg_local_covariance":
+            sigma_mode_sq, diagnostics = compute_cg_local_sigma_mode(train_data.data)
+            diagnostics = {"source": "cg_data", "estimator": "local_covariance", **diagnostics}
+        else:
+            raise ValueError(
+                "dataset.mode_var_computation must be 'potential', 'data_hessian', 'data_empirical', "
+                "or 'cg_local_covariance'; "
+                f"got {mode_var_computation!r}."
+            )
         sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
         log.info(
-            "Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; diagnostics=%s",
+            "Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; "
+            "mode_var_computation=%s; diagnostics=%s",
             sigma_mode_sq,
             sigma_mode_sq_normalized,
+            mode_var_computation,
             diagnostics,
         )
         for ranged_loss in mode_mixture_losses:

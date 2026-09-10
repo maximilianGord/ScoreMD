@@ -17,7 +17,7 @@ from typing import Literal
 LambdaScheme = Literal["song", "dsm_optimal", "tsm_optimal", "uniform"]
 
 
-def compute_lambda_t(
+def _optimal_tsm_lambda(
     sigma_sq: jnp.ndarray,
     sigma_data_sq: jnp.ndarray,
     alpha_sq: jnp.ndarray | float = 1.0,

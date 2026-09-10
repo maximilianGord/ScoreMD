@@ -242,3 +242,64 @@ def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict
     frame_shape = (-1, 3) if full_coordinates is not None else sample_shape
     frames = np.asarray(coordinate_source, dtype=float).reshape((len(datapoints), *frame_shape))
     return compute_sigma_mode(frames, dataset.force, beta=1.0 / float(dataset.kbT), **kwargs)
+
+
+def compute_empirical_sigma_mode(dataset) -> float:
+    """Return the mean coordinate variance of centered training datapoints."""
+    data = np.asarray(dataset.train.data, dtype=float).reshape((len(dataset.train), -1))
+    centered = data - data.mean(axis=0, keepdims=True)
+    return float(np.mean(np.square(centered)))
+
+
+def compute_cg_local_sigma_mode(
+    data: Array,
+    *,
+    n_subsample: int = 256,
+    n_neighbors: int = 64,
+    candidate_subsample: int = 8192,
+    seed: Optional[int] = 0,
+) -> tuple[float, dict[str, float | int]]:
+    """Estimate a scalar CG mode variance from local coordinate neighborhoods.
+
+    ``data`` must be the physical, already aligned coarse-grained coordinates.
+    The median local coordinate variance avoids pooling separate metastable
+    basins, unlike a global empirical variance. The result is in the squared
+    coordinate unit of ``data`` (nm² for ALDP) and must be normalized by the
+    caller when training coordinates are normalized.
+    """
+    frames = np.asarray(data, dtype=float)
+    if frames.ndim < 2 or frames.shape[0] < 2:
+        raise ValueError("data must contain at least two coarse-grained frames.")
+    if not np.all(np.isfinite(frames)):
+        raise ValueError("data must contain only finite coarse-grained coordinates.")
+    if n_subsample <= 0 or n_neighbors < 2 or candidate_subsample < 2:
+        raise ValueError("n_subsample, n_neighbors, and candidate_subsample must be positive; n_neighbors >= 2.")
+
+    flattened = frames.reshape((frames.shape[0], -1))
+    rng = np.random.default_rng(seed)
+    n_candidates = min(int(candidate_subsample), len(flattened))
+    n_references = min(int(n_subsample), len(flattened))
+    n_neighbors = min(int(n_neighbors), n_candidates)
+    candidates = flattened[rng.choice(len(flattened), size=n_candidates, replace=False)]
+    references = flattened[rng.choice(len(flattened), size=n_references, replace=False)]
+
+    local_variances: list[float] = []
+    for reference in references:
+        squared_distances = np.sum(np.square(candidates - reference), axis=1)
+        neighbor_indices = np.argpartition(squared_distances, n_neighbors - 1)[:n_neighbors]
+        neighborhood = candidates[neighbor_indices]
+        local_variances.append(float(np.mean(np.var(neighborhood, axis=0, ddof=1))))
+
+    local = np.asarray(local_variances, dtype=float)
+    estimate = float(np.median(local))
+    if not np.isfinite(estimate) or estimate <= 0.0:
+        raise ValueError("CG local covariance produced a non-positive or non-finite mode variance.")
+    diagnostics: dict[str, float | int] = {
+        "n_references": n_references,
+        "n_candidates": n_candidates,
+        "n_neighbors": n_neighbors,
+        "local_sigma2_median": estimate,
+        "local_sigma2_mean": float(local.mean()),
+        "local_sigma2_std": float(local.std(ddof=0)),
+    }
+    return estimate, diagnostics

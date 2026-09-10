@@ -1,6 +1,6 @@
 import os.path
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import Literal, Tuple
 from deeptime.util import energy2d
 import jax.numpy as jnp
 import jax
@@ -21,9 +21,23 @@ log = logging.getLogger(__name__)
 def mueller_brown_potential(xs: jnp.ndarray, beta: float = 1.0) -> jnp.ndarray:
     """
     Compute the energy of the mueller brown potential.
+
+    Coordinates are normally supplied as ``(..., 2)``.  TSM preprocessing
+    represents a single toy-system frame as ``(2, 1)`` to match the dataset's
+    ``sample_shape``; flatten that representation back to coordinate pairs
+    before extracting ``x`` and ``y``.
     """
+    xs = jnp.asarray(xs)
     if xs.ndim == 1:
-        xs = xs.reshape(1, -1)
+        if xs.shape[0] != 2:
+            raise ValueError(f"Expected two Müller-Brown coordinates, got shape {xs.shape}.")
+        xs = xs.reshape(1, 2)
+    elif xs.shape[-1] == 2:
+        xs = xs.reshape(-1, 2)
+    elif xs.shape[-2:] == (2, 1):
+        xs = xs.reshape(-1, 2)
+    else:
+        raise ValueError(f"Expected coordinates shaped (..., 2) or (..., 2, 1), got {xs.shape}.")
 
     x, y = xs[:, 0], xs[:, 1]
     e1 = -200 * jnp.exp(-((x - 1) ** 2) - 10 * y**2)
@@ -42,6 +56,7 @@ class MuellerBrownSimulation(Dataset):
     dt: float = 1e-4
     beta: float = 1.0
     seed: int = 0
+    mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian"
 
     def __init__(
         self,
@@ -53,8 +68,14 @@ class MuellerBrownSimulation(Dataset):
         dt: float = 1e-4,
         beta: float = 1.0,
         seed: int = 0,
+        mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian",
         name="mueller_brown",
     ):
+        if mode_var_computation not in {"potential", "data_hessian", "data_empirical"}:
+            raise ValueError(
+                "mode_var_computation must be 'potential', 'data_hessian', or 'data_empirical'; "
+                f"got {mode_var_computation!r}."
+            )
         super().__init__(
             name=name,
             sample_shape=(2, 1),
@@ -67,6 +88,16 @@ class MuellerBrownSimulation(Dataset):
         self.dt = dt
         self.beta = beta
         self.seed = seed
+        self.mode_var_computation = mode_var_computation
+
+    def sigma_mode_sq_from_potential(self) -> float:
+        """Return the harmonic mode variance at the global Müller-Brown minimum."""
+        mode = jnp.array([-0.55828035, 1.44169])
+        hessian = jax.hessian(lambda x: self.potential(x[None, :]).sum())(mode)
+        curvatures = jnp.linalg.eigvalsh(hessian)
+        if bool(jnp.any(curvatures <= 0.0)):
+            raise ValueError(f"Müller-Brown mode has non-positive curvatures: {curvatures}.")
+        return float(jnp.mean(self.kbT / curvatures))
 
     def range(self) -> jnp.ndarray:
         return jnp.array([[-1.8, 1.1], [-0.5, 2.0]])

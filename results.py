@@ -279,10 +279,15 @@ def main() -> None:
         mueller_brown_csv_metrics,
     )
 
-    for root, image_file, image_comparison, summary_metric in (
+    image_comparisons = [
         (ALDP_ROOT, ALDP_IMAGE_FILE, comparison["aldp"], ALDP_LANGEVIN_JS_DIVERGENCE),
-        (MUELLER_BROWN_ROOT, MUELLER_BROWN_IMAGE_FILE, comparison["mueller_brown"], None),
-    ):
+    ]
+    if mueller_brown_comparison := comparison.get("mueller_brown"):
+        image_comparisons.append(
+            (MUELLER_BROWN_ROOT, MUELLER_BROWN_IMAGE_FILE, mueller_brown_comparison, None)
+        )
+
+    for root, image_file, image_comparison, summary_metric in image_comparisons:
         folders = image_comparison["folders"]
         image_metrics = image_comparison["metrics"]
         extra_columns = image_comparison.get("extra_col", {})

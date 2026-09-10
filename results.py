@@ -270,19 +270,24 @@ def main() -> None:
         for run_dir in sorted(MUELLER_BROWN_ROOT.glob("*/*"))
         if run_dir.is_dir() and (run_dir / "out").is_dir() and any((run_dir / "out").iterdir())
     ]
-    _, mueller_brown_csv_details, mueller_brown_csv_metrics = map(
-        list, zip(*mueller_brown_csv_run_data)
-    )
-    write_csv(
-        MUELLER_BROWN_CSV_FILE,
-        mueller_brown_csv_details,
-        mueller_brown_csv_metrics,
-    )
+    if mueller_brown_csv_run_data:
+        _, mueller_brown_csv_details, mueller_brown_csv_metrics = map(
+            list, zip(*mueller_brown_csv_run_data)
+        )
+        write_csv(
+            MUELLER_BROWN_CSV_FILE,
+            mueller_brown_csv_details,
+            mueller_brown_csv_metrics,
+        )
+    else:
+        print("Skipping Mueller-Brown CSV: no completed runs found.")
 
     image_comparisons = [
         (ALDP_ROOT, ALDP_IMAGE_FILE, comparison["aldp"], ALDP_LANGEVIN_JS_DIVERGENCE),
     ]
-    if mueller_brown_comparison := comparison.get("mueller_brown"):
+    if mueller_brown_csv_run_data and (
+        mueller_brown_comparison := comparison.get("mueller_brown")
+    ):
         image_comparisons.append(
             (MUELLER_BROWN_ROOT, MUELLER_BROWN_IMAGE_FILE, mueller_brown_comparison, None)
         )

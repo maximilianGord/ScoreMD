@@ -15,6 +15,7 @@ from scoremd.data.dataset.protein import SingleProteinDataset
 import scoremd.diffusion.classic.sde as sdes
 from scoremd.diffusion.classic.utils import perturb
 from scoremd.diffusion.fp import fp_vp_error
+from scoremd.diffusion.tsm import inverse_relative_force_transform
 import wandb as wandb_lib
 from scoremd.data.dataset import ToyDataset, ToyDatasets, Dataset, ALDPDataset, MuellerBrownSimulation
 from scoremd.models.mixture import MixtureOfModels
@@ -60,8 +61,12 @@ def evaluate(
     norm_factor: jnp.ndarray,
     wandb: bool,
     out_dir: str,
+    tsm_force_contribution: str = "absolute",
 ):
     sde = sdes.VP()
+    if tsm_force_contribution not in ("absolute", "relative"):
+        raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
+    use_relative_force_transform = tsm_force_contribution == "relative"
     BS = orig_BS if evaluation.inference_bs is None else evaluation.inference_bs
     num_langevin_samples = (
         min(dataset.train.data.shape[0], 1_000_000)
@@ -71,17 +76,19 @@ def evaluate(
 
     def trained_unnormalized_score(x, features, t, *args, **kwargs):
         """The trained score function without any normalization. This is used for sampling."""
-        return model.apply(params, x, features, t, training=False, *args, **kwargs)
+        score = model.apply(params, x, features, t, training=False, *args, **kwargs)
+        if use_relative_force_transform:
+            return inverse_relative_force_transform(dataset.kbT * score) / dataset.kbT
+        return score
 
     # define the force function (scaled score)
     def force(x: jnp.ndarray, features: jnp.ndarray, **kwargs) -> jnp.ndarray:
-        return (
-            dataset.kbT
-            * model.apply(
-                params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.force
-            )
-            * norm_factor
+        normalized_force = dataset.kbT * model.apply(
+            params, x * norm_factor, features, evaluation.eval_t, training=False, method=model.__class__.force
         )
+        if use_relative_force_transform:
+            normalized_force = inverse_relative_force_transform(normalized_force)
+        return normalized_force * norm_factor
 
     potential = None
     # check if the model has an energy function, and then define it
@@ -109,20 +116,20 @@ def evaluate(
         if dataset.train.data.shape[-1] == 2:
             metrics |= evaluate_toy_normalization_constant(model, params, out_dir)
     elif isinstance(dataset, MuellerBrownSimulation):
-        metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
-        ground_truth_marginals = mueller_brown_marginals(dataset)
-        metrics |= evaluate_mueller_brown_samples(
-            dataset.train,
-            dataset,
-            trained_unnormalized_score,
-            norm_factor,
-            out_dir,
-            ground_truth_marginals,
-            seed=evaluation.seed,
-        )
-        metrics |= simulate_mueller_brown(
-            dataset.train, dataset, force, out_dir, ground_truth_marginals, seed=evaluation.seed
-        )
+        if dataset.is_coarse_grained:
+            metrics |= evaluate_mueller_brown_marginal_samples(
+                dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
+            )
+        else:
+            metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
+            ground_truth_marginals = mueller_brown_marginals(dataset)
+            metrics |= evaluate_mueller_brown_samples(
+                dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, ground_truth_marginals,
+                seed=evaluation.seed,
+            )
+            metrics |= simulate_mueller_brown(
+                dataset.train, dataset, force, out_dir, ground_truth_marginals, seed=evaluation.seed
+            )
     elif isinstance(dataset, ALDPDataset):
         inference_bs = BS
         num_samples = (
@@ -736,6 +743,45 @@ def evaluate_toy_samples(
         plt.close()
 
     return {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
+
+
+def mueller_brown_marginal(dataset: MuellerBrownSimulation, n_grid: int = 512) -> tuple[onp.ndarray, onp.ndarray]:
+    """Integrate out the discarded coordinate to obtain the configured CG density."""
+    if not dataset.is_coarse_grained:
+        raise ValueError("A one-dimensional marginal requires a coarse-grained Müller--Brown dataset.")
+    (x_min, x_max), (y_min, y_max) = onp.asarray(dataset.range())
+    x = onp.linspace(x_min, x_max, n_grid)
+    y = onp.linspace(y_min, y_max, n_grid)
+    xx, yy = onp.meshgrid(x, y, indexing="ij")
+    density = onp.asarray(dataset.likelihood(jnp.asarray(onp.stack((xx.ravel(), yy.ravel()), axis=1)))).reshape(n_grid, n_grid)
+    coordinates, marginal = (x, onp.trapz(density, y, axis=1)) if dataset.coordinate_name == "x" else (y, onp.trapz(density, x, axis=0))
+    return coordinates, marginal / onp.trapz(marginal, coordinates)
+
+
+def evaluate_mueller_brown_marginal_samples(
+    datapoints: Datapoints, dataset: MuellerBrownSimulation, score: Callable, norm_factor: jnp.ndarray, out_dir: str, seed: int
+) -> dict:
+    """Evaluate a one-dimensional CG model against its potential-integrated marginal."""
+    samples = onp.asarray(get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed)).reshape(-1)
+    coordinates, density = mueller_brown_marginal(dataset)
+    truth = onp.asarray(datapoints.data).reshape(-1)
+    fig, axis = plt.subplots(clear=True)
+    axis.plot(coordinates, density, label="Potential-integrated ground truth", linewidth=2)
+    axis.hist(samples, bins=coordinates, density=True, histtype="step", linewidth=2, label="IID samples")
+    axis.set(xlabel=dataset.coordinate_name, ylabel="Marginal density")
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/mueller-brown-{dataset.coordinate_name}-marginal.png", bbox_inches="tight")
+    plt.close(fig)
+    bins = coordinates
+    p = onp.histogram(truth, bins=bins)[0].astype(float)
+    q = onp.histogram(samples, bins=bins)[0].astype(float)
+    p /= p.sum()
+    q /= q.sum()
+    mixture = (p + q) / 2
+    mask_p, mask_q = p > 0, q > 0
+    js_divergence_1d = 0.5 * (onp.sum(p[mask_p] * onp.log(p[mask_p] / mixture[mask_p])) + onp.sum(q[mask_q] * onp.log(q[mask_q] / mixture[mask_q])))
+    return {"eval/iid_js_divergence": float(js_divergence_1d)}
 
 
 def mueller_brown_marginals(dataset: MuellerBrownSimulation, n_grid: int = 512) -> tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray]:

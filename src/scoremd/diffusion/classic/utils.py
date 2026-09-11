@@ -82,6 +82,7 @@ def get_loss(
     tsm_lambda: float = 1.0,
     tsm_t0: float = 0.05,
     tsm_sigma_max: float = 0.01,
+    tsm_force_contribution: str = "absolute",
     sg_type: str = "constant",
     sg_lambda: float = 1.0,
     sg_t0: float = 0.05,
@@ -113,6 +114,8 @@ def get_loss(
     valid_matching_types = ("constant", "hard_cutoff", "smooth_decay", "linear", "linear_decay", "noise_cutoff", "mode_mixture")
     if loss_type == "tsm" and tsm_type not in valid_matching_types:
         raise ValueError(f"Unknown tsm_type={tsm_type!r}.")
+    if tsm_force_contribution not in ("absolute", "relative"):
+        raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
     if loss_type == "sc" and sg_type not in valid_matching_types:
         raise ValueError(f"Unknown sg_type={sg_type!r}.")
     log.info("Using VP-SDE")
@@ -294,6 +297,7 @@ def get_loss(
                     tsm_lambda,
                     tsm_t0,
                     tsm_sigma_max,
+                    tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
                     kbT=kbT,
@@ -318,6 +322,7 @@ def get_loss(
                     tsm_lambda,
                     tsm_t0,
                     tsm_sigma_max,
+                    tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
                     kbT=kbT,
@@ -347,6 +352,7 @@ def get_loss(
                 1.0,          # tsm_lambda: weighting is applied by the caller via lambda_0
                 tsm_t0,
                 tsm_sigma_max,
+                tsm_force_contribution="absolute",
                 sigma_data=sigma_data,
                 sigma_mode_sq=sigma_mode_sq,
                 kbT=kbT,

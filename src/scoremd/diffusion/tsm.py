@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 from typing import Literal
 
 LambdaScheme = Literal["song", "dsm_optimal", "tsm_optimal", "uniform"]
+TSMForceContribution = Literal["absolute", "relative"]
 
 
 def _optimal_tsm_lambda(
@@ -102,6 +103,24 @@ def tsm_weight(
     )
 
 
+def relative_force_transform(force: ArrayLike, eps: float = 1e-12) -> jnp.ndarray:
+    """Map F to F / ||F|| * log(1 + ||F||), independently per sample."""
+    force = jnp.asarray(force)
+    flat_force = force.reshape((force.shape[0], -1))
+    magnitude = jnp.linalg.norm(flat_force, axis=-1)
+    scale = jnp.log1p(magnitude) / jnp.maximum(magnitude, eps)
+    return force * scale.reshape((force.shape[0],) + (1,) * (force.ndim - 1))
+
+
+def inverse_relative_force_transform(transformed_force: ArrayLike, eps: float = 1e-12) -> jnp.ndarray:
+    """Invert :func:`relative_force_transform` independently per sample."""
+    transformed_force = jnp.asarray(transformed_force)
+    flat_force = transformed_force.reshape((transformed_force.shape[0], -1))
+    magnitude = jnp.linalg.norm(flat_force, axis=-1)
+    scale = jnp.expm1(magnitude) / jnp.maximum(magnitude, eps)
+    return transformed_force * scale.reshape((transformed_force.shape[0],) + (1,) * (transformed_force.ndim - 1))
+
+
 def _as_batch_weights(value: ArrayLike, batch_size: int, dtype, name: str) -> jnp.ndarray:
     """Convert a scalar or per-sample value into a batch-shaped vector."""
     value = jnp.asarray(value, dtype=dtype).reshape(-1)
@@ -124,6 +143,7 @@ def tsm_loss(
     tsm_lambda: float,
     tsm_t0: float,
     tsm_sigma_max: float,
+    tsm_force_contribution: TSMForceContribution = "absolute",
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     kbT: float = 1.0,
@@ -132,8 +152,10 @@ def tsm_loss(
     """Compute a time-weighted target score matching loss.
 
     ``x`` is the already perturbed sample ``x_t`` and ``force`` is the
-    physical force evaluated at the corresponding data sample.  The force is
-    converted to a score target as ``force / kbT``.  Sampling ``t`` and
+    physical force evaluated at the corresponding data sample. With
+    ``tsm_force_contribution=\"relative\"``, it is mapped to
+    ``force / ||force|| * log(1 + ||force||)`` per sample before conversion
+    to a score target.  Sampling ``t`` and
     constructing the companion DSM term are deliberately left to the caller.
 
     ``sigma_data`` is the data standard deviation used by the mode-mixture
@@ -167,6 +189,14 @@ def tsm_loss(
     if score.shape != x.shape:
         raise ValueError(f"score must return shape {x.shape}; got {score.shape}.")
 
+    if tsm_force_contribution not in ("absolute", "relative"):
+        raise ValueError(
+            "tsm_force_contribution must be 'absolute' or 'relative'; "
+            f"got {tsm_force_contribution!r}."
+        )
+
+    if tsm_force_contribution == "relative":
+        force = relative_force_transform(force)
     target_score = force / jnp.asarray(kbT, dtype=x.dtype)
     squared_error = jnp.square(score - target_score).reshape((x.shape[0], -1))
     loss_per_sample = jnp.mean(squared_error, axis=-1)

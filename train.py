@@ -67,7 +67,7 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
         dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
     )
     force_frames = (
-        np.asarray(force_coordinates).reshape((len(datapoints), -1, 3))
+        np.asarray(force_coordinates).reshape((len(datapoints), *np.asarray(force_coordinates).shape[1:]))
         if force_coordinates is not None
         else target_frames
     )
@@ -376,6 +376,13 @@ def training_routine(
 
     if evaluation.seed is None:
         evaluation.seed = seed
+    tsm_force_contributions = {
+        _loss_options(loss).get("tsm_force_contribution", "absolute")
+        for loss in training_schedule.losses
+        if _loss_options(loss).get("loss_type") == "tsm"
+    }
+    if len(tsm_force_contributions) > 1:
+        raise ValueError("Evaluation cannot combine absolute and relative TSM force contributions.")
     evaluate(
         unified_model,
         state.ema_params,
@@ -385,6 +392,7 @@ def training_routine(
         norm_factor,
         wandb["enabled"],
         out_dir,
+        tsm_force_contribution=next(iter(tsm_force_contributions), "absolute"),
     )
 
 

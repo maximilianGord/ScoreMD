@@ -1,12 +1,13 @@
 import os.path
 from dataclasses import dataclass, field
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 from deeptime.util import energy2d
 import jax.numpy as jnp
 import jax
 import logging
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+from enum import Enum
 from scoremd.data.dataset.base import Datapoints
 from scoremd.utils.file import get_persistent_storage
 import hashlib
@@ -16,6 +17,14 @@ from . import Dataset
 from ...simulation import create_langevin_step_function, simulate
 
 log = logging.getLogger(__name__)
+
+
+class MuellerBrownCoarseGrainingLevel(Enum):
+    """Coordinates retained from a two-dimensional Müller--Brown frame."""
+
+    NONE = "NONE"
+    X_MARGINAL = "X_MARGINAL"
+    Y_MARGINAL = "Y_MARGINAL"
 
 
 def mueller_brown_potential(xs: jnp.ndarray, beta: float = 1.0) -> jnp.ndarray:
@@ -57,6 +66,7 @@ class MuellerBrownSimulation(Dataset):
     beta: float = 1.0
     seed: int = 0
     mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian"
+    coarse_graining_level: MuellerBrownCoarseGrainingLevel = MuellerBrownCoarseGrainingLevel.NONE
 
     def __init__(
         self,
@@ -69,6 +79,7 @@ class MuellerBrownSimulation(Dataset):
         beta: float = 1.0,
         seed: int = 0,
         mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian",
+        coarse_graining_level: MuellerBrownCoarseGrainingLevel | str = MuellerBrownCoarseGrainingLevel.NONE,
         name="mueller_brown",
     ):
         if mode_var_computation not in {"potential", "data_hessian", "data_empirical"}:
@@ -76,19 +87,61 @@ class MuellerBrownSimulation(Dataset):
                 "mode_var_computation must be 'potential', 'data_hessian', or 'data_empirical'; "
                 f"got {mode_var_computation!r}."
             )
+        self.coarse_graining_level = (
+            coarse_graining_level
+            if isinstance(coarse_graining_level, MuellerBrownCoarseGrainingLevel)
+            else MuellerBrownCoarseGrainingLevel(coarse_graining_level.upper())
+        )
+        self._coordinate_index: Optional[int] = {
+            MuellerBrownCoarseGrainingLevel.X_MARGINAL: 0,
+            MuellerBrownCoarseGrainingLevel.Y_MARGINAL: 1,
+        }.get(self.coarse_graining_level)
+        self._train_force_coordinates = None
         super().__init__(
             name=name,
-            sample_shape=(2, 1),
+            sample_shape=(2, 1) if self._coordinate_index is None else (1, 1),
             kbT=kbT,
         )
         self.n_samples = n_samples
         self.n_steps = n_steps
-        self.mass = jnp.array(mass)
+        self.full_mass = jnp.array(mass)
+        self.mass = self.full_mass if self._coordinate_index is None else self.full_mass[self._coordinate_index : self._coordinate_index + 1]
         self.gamma = gamma
         self.dt = dt
         self.beta = beta
         self.seed = seed
         self.mode_var_computation = mode_var_computation
+
+    @property
+    def is_coarse_grained(self) -> bool:
+        return self._coordinate_index is not None
+
+    @property
+    def coordinate_name(self) -> str:
+        if self._coordinate_index is None:
+            raise ValueError("The full Müller--Brown system has no single retained coordinate.")
+        return ("x", "y")[self._coordinate_index]
+
+    def force_coordinates_for(self, datapoints: Datapoints) -> Optional[jnp.ndarray]:
+        """Return paired full frames for one-time coarse-grained force projection."""
+        if datapoints is self._train:
+            return self._train_force_coordinates
+        if self.is_coarse_grained:
+            raise ValueError("Projected Müller--Brown forces require paired full coordinates.")
+        return None
+
+    def release_force_coordinates(self, datapoints: Datapoints) -> None:
+        if datapoints is self._train:
+            self._train_force_coordinates = None
+
+    def project_forces(self, full_forces: jnp.ndarray) -> jnp.ndarray:
+        """Return the instantaneous force along the retained CG coordinate."""
+        if self._coordinate_index is None:
+            return full_forces
+        full_forces = jnp.asarray(full_forces).reshape(-1)
+        if full_forces.shape != (2,):
+            raise ValueError(f"Expected a two-component Müller--Brown force, got {full_forces.shape}.")
+        return full_forces[self._coordinate_index : self._coordinate_index + 1]
 
     def sigma_mode_sq_from_potential(self) -> float:
         """Return the harmonic mode variance at the global Müller-Brown minimum."""
@@ -134,6 +187,9 @@ class MuellerBrownSimulation(Dataset):
             data = self._generate_data(key)
             jnp.save(os.path.join(dir, file_name), data)
 
+        if self._coordinate_index is not None:
+            self._train_force_coordinates = data
+            data = data[:, self._coordinate_index : self._coordinate_index + 1]
         return Datapoints(data, None), None, None
 
     def _generate_data(self, key):
@@ -141,10 +197,10 @@ class MuellerBrownSimulation(Dataset):
 
         starting_point = jnp.array([-0.55828035, 1.44169])
         # Sample the starting velocity from the Boltzmann distribution
-        starting_velocity = jnp.sqrt(self.kbT / self.mass) * jax.random.normal(velocity_key, (2,))
+        starting_velocity = jnp.sqrt(self.kbT / self.full_mass) * jax.random.normal(velocity_key, (2,))
 
         step = jax.jit(
-            create_langevin_step_function(self.force, self.mass, self.gamma, self.n_steps, self.dt, self.kbT)
+            create_langevin_step_function(self.force, self.full_mass, self.gamma, self.n_steps, self.dt, self.kbT)
         )
         trajectory, _ = simulate(starting_point, starting_velocity, step, self.n_samples, key)
         return trajectory

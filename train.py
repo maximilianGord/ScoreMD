@@ -3,6 +3,7 @@ from scoremd.utils import slurm
 from scoremd.utils.file import (
     get_persistent_storage,
 )  # this should be the very first line so that the .env file is loaded
+import hashlib
 import logging
 import os
 import functools
@@ -51,6 +52,25 @@ def _set_runtime_loss_options(ranged_loss, **options) -> None:
     ranged_loss.loss = functools.partial(loss_factory.func, *loss_factory.args, **keywords)
 
 
+def _forces_cache_path(dataset: Dataset, datapoints: Datapoints) -> Optional[str]:
+    """Deterministic on-disk cache location for a (dataset, datapoints) pair's physical forces.
+
+    Physical forces are a pure function of the sample positions, so once computed for a given
+    dataset config and set of samples they never change; caching avoids repeating a potentially
+    slow (e.g. per-sample OpenMM) computation across every run that reuses the same data.
+    """
+    try:
+        sha256 = hashlib.sha256()
+        sha256.update(repr(dataset).encode("utf-8"))
+        sha256.update(np.asarray(datapoints.data).tobytes())
+        digest = sha256.hexdigest()
+    except Exception as e:
+        log.warning("Could not compute a forces cache key; forces will not be cached: %s", e)
+        return None
+    directory = os.path.join(get_persistent_storage(), getattr(dataset, "name", type(dataset).__name__), "forces")
+    return os.path.join(directory, f"{digest}.npy")
+
+
 def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Optional[Datapoints]:
     """Attach physical forces to datapoints before entering JAX training."""
     if datapoints is None or datapoints.forces is not None:
@@ -61,6 +81,24 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     sample_shape = tuple(dataset.sample_shape)
     if datapoints.data.shape[1] != int(np.prod(sample_shape)):
         raise ValueError("Datapoint coordinate dimension does not match dataset.sample_shape.")
+
+    cache_path = _forces_cache_path(dataset, datapoints)
+    if cache_path is not None and os.path.exists(cache_path):
+        try:
+            cached_forces = np.load(cache_path)
+            if cached_forces.shape == datapoints.data.shape:
+                log.info("Loaded cached physical forces from %s", cache_path)
+                if hasattr(dataset, "release_force_coordinates"):
+                    dataset.release_force_coordinates(datapoints)
+                return datapoints.replace(forces=jnp.asarray(cached_forces))
+            log.warning(
+                "Cached forces at %s have shape %s, expected %s; recomputing.",
+                cache_path,
+                cached_forces.shape,
+                datapoints.data.shape,
+            )
+        except Exception as e:
+            log.warning("Failed to load cached forces from %s: %s", cache_path, e)
 
     target_frames = np.asarray(datapoints.data).reshape((-1, *sample_shape))
     force_coordinates = (
@@ -82,7 +120,15 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
         forces[index] = force
     if hasattr(dataset, "release_force_coordinates"):
         dataset.release_force_coordinates(datapoints)
-    return datapoints.replace(forces=jnp.asarray(forces.reshape(datapoints.data.shape)))
+    forces = forces.reshape(datapoints.data.shape)
+    if cache_path is not None:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            np.save(cache_path, forces)
+            log.info("Cached physical forces to %s", cache_path)
+        except Exception as e:
+            log.warning("Failed to cache forces to %s: %s", cache_path, e)
+    return datapoints.replace(forces=jnp.asarray(forces))
 
 
 def _prepare_tsm_inputs(

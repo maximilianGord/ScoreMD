@@ -120,6 +120,17 @@ def evaluate(
             metrics |= evaluate_mueller_brown_marginal_samples(
                 dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
             )
+            if num_langevin_samples > 0:
+                metrics |= simulate_mueller_brown_marginal(
+                    dataset.train,
+                    dataset,
+                    force,
+                    out_dir,
+                    n_samples=num_langevin_samples,
+                    n_intermediate_steps=evaluation.num_langevin_intermediate_steps,
+                    langevin_dt=evaluation.langevin_dt,
+                    seed=evaluation.seed,
+                )
         else:
             metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
             ground_truth_marginals = mueller_brown_marginals(dataset)
@@ -782,6 +793,97 @@ def evaluate_mueller_brown_marginal_samples(
     mask_p, mask_q = p > 0, q > 0
     js_divergence_1d = 0.5 * (onp.sum(p[mask_p] * onp.log(p[mask_p] / mixture[mask_p])) + onp.sum(q[mask_q] * onp.log(q[mask_q] / mixture[mask_q])))
     return {"eval/iid_js_divergence": float(js_divergence_1d)}
+
+
+def _marginal_histogram_js(
+    truth: onp.ndarray, samples: onp.ndarray, bin_edges: onp.ndarray
+) -> tuple[float, float]:
+    """Return 1D histogram JS divergence and the fraction outside the plotting range."""
+    truth = onp.asarray(truth, dtype=float).reshape(-1)
+    samples = onp.asarray(samples, dtype=float).reshape(-1)
+    if not onp.all(onp.isfinite(truth)) or not onp.all(onp.isfinite(samples)):
+        raise ValueError("Marginal evaluation requires finite reference data and trajectory samples.")
+
+    # np.digitize creates explicit lower and upper outlier buckets.  Unlike a
+    # plain histogram, escaped Langevin samples remain part of the divergence.
+    n_bins = len(bin_edges) + 1
+    p = onp.bincount(onp.digitize(truth, bin_edges), minlength=n_bins).astype(float)
+    q = onp.bincount(onp.digitize(samples, bin_edges), minlength=n_bins).astype(float)
+    p /= p.sum()
+    q /= q.sum()
+    mixture = (p + q) / 2
+    mask_p, mask_q = p > 0, q > 0
+    divergence = 0.5 * (
+        onp.sum(p[mask_p] * onp.log(p[mask_p] / mixture[mask_p]))
+        + onp.sum(q[mask_q] * onp.log(q[mask_q] / mixture[mask_q]))
+    )
+    outlier_fraction = onp.mean((samples < bin_edges[0]) | (samples > bin_edges[-1]))
+    return float(divergence), float(outlier_fraction)
+
+
+def simulate_mueller_brown_marginal(
+    datapoints: Datapoints,
+    dataset: MuellerBrownSimulation,
+    force: Callable[[jnp.ndarray, Optional[jnp.ndarray]], jnp.ndarray],
+    out_dir: str,
+    *,
+    n_samples: int,
+    n_intermediate_steps: int,
+    langevin_dt: Optional[float],
+    seed: int,
+) -> dict:
+    """Simulate the learned one-dimensional Muller--Brown marginal force."""
+    if not dataset.is_coarse_grained:
+        raise ValueError("Marginal Langevin evaluation requires a coarse-grained Muller--Brown dataset.")
+    if n_samples <= 0 or n_intermediate_steps <= 0:
+        raise ValueError("n_samples and n_intermediate_steps must be positive.")
+
+    key = jax.random.PRNGKey(seed)
+    key, velocity_key = jax.random.split(key)
+    mode = jnp.array([-0.55828035, 1.44169])
+    coordinate_index = 0 if dataset.coordinate_name == "x" else 1
+    initial_position = mode[coordinate_index : coordinate_index + 1]
+    mass = jnp.asarray(dataset.mass).reshape(-1)
+    initial_velocity = jnp.sqrt(dataset.kbT / mass) * jax.random.normal(velocity_key, mass.shape)
+
+    @jax.jit
+    def adjusted_force(x):
+        return force(x.reshape(1, -1), None).reshape(-1)
+
+    timestep = dataset.dt if langevin_dt is None else langevin_dt
+    step = jax.jit(
+        create_langevin_step_function(
+            adjusted_force, mass, dataset.gamma, n_intermediate_steps, timestep, dataset.kbT
+        )
+    )
+    log.info(
+        "Simulating %d one-dimensional Langevin samples with %d intermediate steps and dt=%g",
+        n_samples,
+        n_intermediate_steps,
+        timestep,
+    )
+    trajectory, _ = simulate(initial_position, initial_velocity, step, n_samples, key)
+    samples = onp.asarray(trajectory).reshape(-1)
+    if not onp.all(onp.isfinite(samples)):
+        raise ValueError("One-dimensional Langevin trajectory contains non-finite samples.")
+
+    coordinates, density = mueller_brown_marginal(dataset)
+    truth = onp.asarray(datapoints.data).reshape(-1)
+    js_divergence_1d, outlier_fraction = _marginal_histogram_js(truth, samples, coordinates)
+    fig, axis = plt.subplots(clear=True)
+    axis.plot(coordinates, density, label="Potential-integrated ground truth", linewidth=2)
+    axis.hist(samples, bins=coordinates, density=True, histtype="step", linewidth=2, label="Langevin samples")
+    axis.set(xlabel=dataset.coordinate_name, ylabel="Marginal density")
+    axis.set_title(f"Outside plotted range: {outlier_fraction:.2%}")
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(f"{out_dir}/mueller-brown-{dataset.coordinate_name}-langevin-marginal.png", bbox_inches="tight")
+    plt.close(fig)
+
+    return {
+        "eval/langevin_marginal_js_divergence": js_divergence_1d,
+        "eval/langevin_marginal_outlier_fraction": outlier_fraction,
+    }
 
 
 def mueller_brown_marginals(dataset: MuellerBrownSimulation, n_grid: int = 512) -> tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray]:

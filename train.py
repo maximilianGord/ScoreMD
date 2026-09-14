@@ -133,10 +133,21 @@ def _prepare_tsm_inputs(
         elif mode_var_computation == "cg_local_covariance":
             sigma_mode_sq, diagnostics = compute_cg_local_sigma_mode(train_data.data)
             diagnostics = {"source": "cg_data", "estimator": "local_covariance", **diagnostics}
+        elif mode_var_computation == "gmm":
+            from scoremd.data.dataset.utils import compute_gmm_sigma_mode
+
+            sigma_mode_sq, diagnostics = compute_gmm_sigma_mode(
+                train_data.data,
+                n_components=getattr(dataset, "gmm_n_components", None),
+                covariance_type=getattr(dataset, "gmm_covariance_type", "full"),
+                block_size=getattr(dataset, "gmm_block_size", None),
+                return_diagnostics=True,
+            )
+            diagnostics = {"source": "data", "estimator": "gaussian_mixture", **diagnostics}
         else:
             raise ValueError(
                 "dataset.mode_var_computation must be 'potential', 'data_hessian', 'data_empirical', "
-                "or 'cg_local_covariance'; "
+                "'cg_local_covariance', or 'gmm'; "
                 f"got {mode_var_computation!r}."
             )
         sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)

@@ -87,6 +87,7 @@ def get_loss(
     sg_lambda: float = 1.0,
     sg_t0: float = 0.05,
     sg_sigma_max: float = 0.01,
+    t_0_lambda: float = 1.0,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     kbT: float = 1.0,
@@ -349,7 +350,7 @@ def get_loss(
                 t0,
                 time_weighting,
                 "constant",   # L_force,0 is an unconditional anchor, not schedule-weighted
-                1.0,          # tsm_lambda: weighting is applied by the caller via lambda_0
+                t_0_lambda,   # tsm_lambda: fixed weight on the t=0 force anchor, independent of sg_type
                 tsm_t0,
                 tsm_sigma_max,
                 tsm_force_contribution="absolute",

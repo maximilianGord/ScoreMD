@@ -41,7 +41,10 @@ class ALDPDataset(Dataset):
     test: bool = False
     path: Optional[PathLike] = None  # Can be used to load a custom dataset
     seed: int = 0
-    mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance"] = "data_hessian"
+    mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance", "gmm"] = "data_hessian"
+    gmm_n_components: Optional[int] = None
+    gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full"
+    gmm_block_size: Optional[int] = None
 
     def __init__(
         self,
@@ -51,19 +54,37 @@ class ALDPDataset(Dataset):
         limit_samples: Optional[int] = None,
         validation: bool = True,
         seed: int = 0,
-        mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance"] = "data_hessian",
+        mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance", "gmm"] = "data_hessian",
+        gmm_n_components: Optional[int] = None,
+        gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full",
+        gmm_block_size: Optional[int] = None,
         name="aldp",
     ):
-        if mode_var_computation not in {"data_hessian", "data_empirical", "cg_local_covariance"}:
+        if mode_var_computation not in {"data_hessian", "data_empirical", "cg_local_covariance", "gmm"}:
             raise ValueError(
-                "mode_var_computation must be 'data_hessian', 'data_empirical', or "
-                f"'cg_local_covariance'; got {mode_var_computation!r}."
+                "mode_var_computation must be 'data_hessian', 'data_empirical', "
+                f"'cg_local_covariance', or 'gmm'; got {mode_var_computation!r}."
+            )
+        if gmm_n_components is not None and gmm_n_components <= 0:
+            raise ValueError(f"gmm_n_components must be positive or None; got {gmm_n_components!r}.")
+        if gmm_covariance_type not in {"full", "diag", "spherical", "block"}:
+            raise ValueError(
+                "gmm_covariance_type must be 'full', 'diag', 'spherical', or 'block'; "
+                f"got {gmm_covariance_type!r}."
+            )
+        if gmm_covariance_type == "block" and (gmm_block_size is None or gmm_block_size <= 0):
+            raise ValueError(
+                "gmm_block_size must be a positive integer (number of atoms per block) "
+                f"when gmm_covariance_type='block'; got {gmm_block_size!r}."
             )
         self.train_split = train_split
         self.limit_samples = limit_samples
         self.validation = validation
         self.seed = seed
         self.mode_var_computation = mode_var_computation
+        self.gmm_n_components = gmm_n_components
+        self.gmm_covariance_type = gmm_covariance_type
+        self.gmm_block_size = gmm_block_size
         self._dataset = None
         self._path = path
         self._train_force_coordinates = None

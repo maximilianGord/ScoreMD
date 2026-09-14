@@ -132,6 +132,8 @@ def plot_fes(
     weights: Optional[jnp.ndarray] = None,
     bw_method: float = 0.05,
     linewidth: float = 3,
+    smooth_above_fes: Optional[float] = None,
+    cap_slope: float = 0.01,
     *args,
     **kwargs,
 ):
@@ -146,8 +148,17 @@ def plot_fes(
     else:
         print("Warning: No values will be inside the range after filtering, not filtering")
 
-    fes = -kBT * gaussian_kde(samples, bw_method, weights).logpdf(grid)
+    density = gaussian_kde(samples, bw_method, weights).pdf(grid)
+    fes = -kBT * jnp.log(jnp.clip(density, a_min=jnp.finfo(density.dtype).tiny))
+
     fes -= fes.min()
+
+    if smooth_above_fes is not None:
+        # points at/below the threshold are untouched; above it, keep rising but at
+        # cap_slope of the real slope instead of jumping straight to a distant anchor
+        # point (as a bridge/interpolation would) or flattening outright.
+        excess = jnp.clip(fes - smooth_above_fes, a_min=0.0)
+        fes = jnp.where(fes > smooth_above_fes, smooth_above_fes + cap_slope * excess, fes)
 
     plt.plot(grid, fes, linewidth=linewidth, *args, **kwargs)
     plt.xlim(grid.min(), grid.max())

@@ -303,3 +303,238 @@ def compute_cg_local_sigma_mode(
         "local_sigma2_std": float(local.std(ddof=0)),
     }
     return estimate, diagnostics
+
+
+def _component_scale(covariance: Array, covariance_type: str) -> float:
+    """Reduce one Gaussian-mixture component's covariance to an isotropic scalar.
+
+    Uses the geometric mean of the covariance's eigenvalues -- the variance of
+    the isotropic Gaussian with the same differential entropy as the fitted
+    (possibly anisotropic) component. This avoids collapsing an anisotropic
+    mode (e.g. stiff bonds mixed with a soft dihedral) into an arithmetic
+    mean, which would be dominated by whichever eigenvalue is largest.
+    """
+    if covariance_type == "full":
+        eigenvalues = np.linalg.eigvalsh(covariance)
+    elif covariance_type == "diag":
+        eigenvalues = np.asarray(covariance)
+    elif covariance_type == "spherical":
+        eigenvalues = np.full(1, covariance)
+    else:
+        raise ValueError(f"Unsupported covariance_type for scale reduction: {covariance_type!r}.")
+    eigenvalues = np.clip(eigenvalues, a_min=np.finfo(float).tiny, a_max=None)
+    return float(np.exp(np.mean(np.log(eigenvalues))))
+
+
+def _partition_into_blocks(n_coords: int, block_size: int, coords_per_atom: int = 3) -> list[Array]:
+    """Partition flattened Cartesian coordinate indices into contiguous atom blocks.
+
+    Assumes coordinates are ordered atom-major (atom 0's x,y,z, then atom 1's,
+    ...), matching how full-atom frames are flattened elsewhere in this
+    module. ``block_size`` is in atoms rather than raw coordinates so it
+    stays meaningful regardless of ``coords_per_atom``. The final block is
+    truncated (not dropped) when ``n_atoms`` isn't a multiple of
+    ``block_size``.
+    """
+    if coords_per_atom <= 0:
+        raise ValueError("coords_per_atom must be positive.")
+    if n_coords % coords_per_atom != 0:
+        raise ValueError(
+            "Block covariance requires coordinates ordered atom-major with "
+            f"coords_per_atom={coords_per_atom}; got {n_coords} total coordinates."
+        )
+    if block_size <= 0:
+        raise ValueError("block_size must be a positive integer number of atoms.")
+    n_atoms = n_coords // coords_per_atom
+    blocks = []
+    for start_atom in range(0, n_atoms, block_size):
+        end_atom = min(start_atom + block_size, n_atoms)
+        blocks.append(np.arange(start_atom * coords_per_atom, end_atom * coords_per_atom))
+    return blocks
+
+
+class _BlockDiagonalGMM:
+    """Minimal ``GaussianMixture``-like result for a block-diagonal-covariance fit.
+
+    Exposes just enough of sklearn's ``GaussianMixture`` interface
+    (``n_components``, ``weights_``, ``covariances_``, ``bic``) for
+    :func:`compute_gmm_sigma_mode`'s k-selection loop to treat it the same as
+    a real ``GaussianMixture``.
+    """
+
+    def __init__(self, weights: Array, covariances: Array, bic_value: float):
+        self.n_components = len(weights)
+        self.weights_ = weights
+        self.covariances_ = covariances  # (n_components, d, d); zero outside each block
+        self._bic_value = bic_value
+
+    def bic(self, X: Array) -> float:
+        del X
+        return self._bic_value
+
+
+def _fit_block_diagonal_gmm(
+    flattened: Array,
+    n_components: int,
+    blocks: list[Array],
+    *,
+    reg_covar: float,
+    n_init: int,
+    seed: Optional[int],
+) -> _BlockDiagonalGMM:
+    """Fit a Gaussian mixture whose per-component covariance is block-diagonal.
+
+    sklearn has no ``covariance_type`` for this. Responsibilities instead
+    come from a converged ``covariance_type="diag"`` fit (cheap, stable), and
+    each component's block covariances are computed in closed form from
+    those responsibilities -- an exact M-step under the block-diagonal
+    constraint, just not re-iterated against a re-derived E-step. That's a
+    deliberate simplification: this only needs the resulting per-mode scale,
+    not a maximum-likelihood block-covariance mixture model.
+    """
+    from sklearn.mixture import GaussianMixture
+    from scipy.special import logsumexp
+    from scipy.stats import multivariate_normal
+
+    seed_gmm = GaussianMixture(
+        n_components=n_components,
+        covariance_type="diag",
+        reg_covar=reg_covar,
+        n_init=n_init,
+        random_state=seed,
+    ).fit(flattened)
+
+    resp = seed_gmm.predict_proba(flattened)  # (n_samples, n_components)
+    n_k = resp.sum(axis=0)
+    weights = n_k / flattened.shape[0]
+    means = (resp.T @ flattened) / n_k[:, None]
+
+    n_coords = flattened.shape[1]
+    covariances = np.zeros((n_components, n_coords, n_coords))
+    log_probs = np.zeros((flattened.shape[0], n_components))
+    for k in range(n_components):
+        diff = flattened - means[k]
+        weighted_diff = diff * resp[:, k, None]
+        block_log_density = np.zeros(flattened.shape[0])
+        for block in blocks:
+            block_cov = (weighted_diff[:, block].T @ diff[:, block]) / n_k[k]
+            block_cov.flat[:: len(block) + 1] += reg_covar
+            covariances[k][np.ix_(block, block)] = block_cov
+            block_log_density += multivariate_normal.logpdf(
+                flattened[:, block], mean=means[k, block], cov=block_cov, allow_singular=True
+            )
+        log_probs[:, k] = np.log(np.maximum(weights[k], np.finfo(float).tiny)) + block_log_density
+
+    log_likelihood = float(np.sum(logsumexp(log_probs, axis=1)))
+    n_block_cov_params = sum(len(block) * (len(block) + 1) // 2 for block in blocks)
+    n_params = (n_components - 1) + n_components * n_coords + n_components * n_block_cov_params
+    bic = -2.0 * log_likelihood + n_params * np.log(flattened.shape[0])
+
+    return _BlockDiagonalGMM(weights, covariances, bic)
+
+
+def compute_gmm_sigma_mode(
+    data: Array,
+    *,
+    n_components: Optional[int] = None,
+    max_components: int = 8,
+    covariance_type: str = "full",
+    block_size: Optional[int] = None,
+    coords_per_atom: int = 3,
+    reg_covar: float = 1e-6,
+    n_init: int = 5,
+    seed: Optional[int] = 0,
+    return_diagnostics: bool = False,
+) -> float | tuple[float, dict[str, float | int]]:
+    """Estimate a mixture-of-Gaussians mode variance directly from training data.
+
+    Fits a Gaussian mixture model to ``data`` (already aligned/normalized the
+    same way training coordinates are) instead of deriving a mode variance
+    from force curvature. Each component's covariance is reduced to a scalar
+    via :func:`_component_scale`, and the returned estimate is the
+    mixing-weight-averaged scalar across components, so within-mode
+    anisotropy and between-mode heterogeneity are both represented without
+    conflating them with the *separation* between modes.
+
+    ``covariance_type="block"`` is a middle ground between ``"diag"``
+    (ignores all correlation) and ``"full"`` (a dense ``d x d`` matrix per
+    component, expensive and data-hungry in high dimensions): it keeps
+    covariance only within contiguous groups of ``block_size`` atoms
+    (``coords_per_atom`` coordinates each) and zeroes it between groups, so
+    it captures local correlation (e.g. one atom's x/y/z, or a small bonded
+    neighborhood) while staying far cheaper and more sample-efficient than
+    ``"full"``. Requires ``block_size`` and atom-major-flattened Cartesian
+    coordinates.
+
+    When ``n_components`` is ``None``, the number of components is selected
+    by BIC over ``1..max_components``. ``data`` may have any trailing shape;
+    it is flattened per frame before fitting.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    flattened = np.asarray(data, dtype=float).reshape((np.asarray(data).shape[0], -1))
+    if flattened.shape[0] < 2:
+        raise ValueError("data must contain at least two frames.")
+    if max_components <= 0:
+        raise ValueError("max_components must be positive.")
+    if covariance_type not in ("full", "diag", "spherical", "block"):
+        raise ValueError(
+            f"Unsupported covariance_type={covariance_type!r}; use 'full', 'diag', 'spherical', or 'block'."
+        )
+
+    blocks: Optional[list[Array]] = None
+    if covariance_type == "block":
+        if block_size is None:
+            raise ValueError("block_size (number of atoms per block) is required when covariance_type='block'.")
+        blocks = _partition_into_blocks(flattened.shape[1], block_size, coords_per_atom=coords_per_atom)
+
+    def _fit(k: int):
+        if covariance_type == "block":
+            return _fit_block_diagonal_gmm(flattened, k, blocks, reg_covar=reg_covar, n_init=n_init, seed=seed)
+        return GaussianMixture(
+            n_components=k,
+            covariance_type=covariance_type,
+            reg_covar=reg_covar,
+            n_init=n_init,
+            random_state=seed,
+        ).fit(flattened)
+
+    bic_by_k: dict[int, float] = {}
+    if n_components is None:
+        candidates = range(1, max(1, min(max_components, flattened.shape[0] - 1)) + 1)
+        best_gmm = None
+        for k in candidates:
+            gmm = _fit(k)
+            bic_by_k[k] = float(gmm.bic(flattened))
+            if best_gmm is None or bic_by_k[k] < bic_by_k[best_gmm.n_components]:
+                best_gmm = gmm
+        gmm = best_gmm
+    else:
+        if n_components <= 0:
+            raise ValueError("n_components must be positive.")
+        gmm = _fit(n_components)
+        bic_by_k[n_components] = float(gmm.bic(flattened))
+
+    scale_covariance_type = "full" if covariance_type == "block" else covariance_type
+    component_scales = np.asarray(
+        [_component_scale(gmm.covariances_[k], scale_covariance_type) for k in range(gmm.n_components)]
+    )
+    weights = np.asarray(gmm.weights_)
+    estimate = float(np.sum(weights * component_scales))
+    if not np.isfinite(estimate) or estimate <= 0.0:
+        raise ValueError("GMM mode-variance estimate is non-positive or non-finite.")
+
+    if not return_diagnostics:
+        return estimate
+
+    diagnostics: dict[str, float | int] = {
+        "n_components": int(gmm.n_components),
+        "bic_by_k": bic_by_k,
+        "component_weights": weights.tolist(),
+        "component_scale": component_scales.tolist(),
+        "covariance_type": covariance_type,
+    }
+    if covariance_type == "block":
+        diagnostics["block_size"] = int(block_size)
+        diagnostics["n_blocks"] = len(blocks)
+    return estimate, diagnostics

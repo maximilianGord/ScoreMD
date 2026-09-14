@@ -25,7 +25,11 @@ PADDING = 12
 LABEL_WIDTH = 220
 HEADER_HEIGHT = 58
 METRIC_HEIGHT = 30
-ALDP_LANGEVIN_JS_DIVERGENCE = "eval/aldp_langevin_js_divergence"
+ALDP_SUMMARY_METRICS = [
+    "eval/aldp_langevin_js_divergence",
+    "eval/aldp_langevin_rms_fe_sq_error",
+    "eval/aldp_iid_js_divergence",
+]
 
 
 def loss_options(config: dict[str, Any]) -> dict[str, Any]:
@@ -91,7 +95,14 @@ def plot_label(run_dir: Path, config: dict[str, Any], run: str) -> str:
     alpha = float(loss.get("alpha", 0.0) or 0.0)
     beta = float(loss.get("beta", 0.0) or 0.0)
     loss_type = "fp" if configured_loss_type == "dsm" and (alpha > 0 or beta > 0) else configured_loss_type
-    lines = [run, f"loss_type={loss_type}"]
+    evaluation = config.get("evaluation", {})
+    lines = [
+        run,
+        f"loss_type={loss_type}",
+        f"coarse_graining_level={config.get('dataset', {}).get('coarse_graining_level', '')}",
+        f"num_langevin_samples={evaluation.get('num_langevin_samples', '')}",
+        f"parallel_trajectories={evaluation.get('num_parallel_langevin_samples', '')}",
+    ]
 
     if configured_loss_type == "tsm":
         lines.extend(
@@ -102,7 +113,7 @@ def plot_label(run_dir: Path, config: dict[str, Any], run: str) -> str:
     elif configured_loss_type == "sc":
         lines.extend(
             f"{key}={loss.get(key, '')}"
-            for key in ("sg_type", "sg_lambda", "sg_sigma_max")
+            for key in ("sg_type", "sg_lambda", "sg_sigma_max", "t_0_lambda")
         )
         matching_type = str(loss.get("sg_type", ""))
     else:
@@ -202,7 +213,7 @@ def write_comparison_image(
     metrics: list[dict[str, Any]],
     image_metrics: list[str],
     extra_columns: dict[str, str],
-    summary_metric: str | None = None,
+    summary_metrics: list[str] | None = None,
 ) -> None:
     image_names = [metric if metric.endswith(".png") else f"{metric}.png" for metric in image_metrics]
     extra_images = [(title, load_image(Path(path), title)) for title, path in extra_columns.items()]
@@ -221,8 +232,8 @@ def write_comparison_image(
         ) + 2 * PADDING,
     )
     width = LABEL_WIDTH + column_count * (cell_width + PADDING) + PADDING
-    metric_height = METRIC_HEIGHT if summary_metric else 0
-    height = header_height + len(image_names) * (cell_height + PADDING) + metric_height + PADDING
+    metric_block_height = METRIC_HEIGHT * len(summary_metrics) if summary_metrics else 0
+    height = header_height + len(image_names) * (cell_height + PADDING) + metric_block_height + PADDING
     canvas = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(canvas)
     font = ImageFont.load_default()
@@ -242,14 +253,15 @@ def write_comparison_image(
             left = LABEL_WIDTH + PADDING + column * (cell_width + PADDING)
             canvas.paste(image, (left + (cell_width - image.width) // 2, top + (cell_height - image.height) // 2))
 
-    if summary_metric:
-        top = header_height + len(image_names) * (cell_height + PADDING)
-        metric_label = summary_metric.removeprefix("eval/")
-        draw_text_centered(draw, (0, top, LABEL_WIDTH, top + metric_height), metric_label, font)
-        for run_column, run_metrics in enumerate(metrics, start=len(extra_images)):
-            left = LABEL_WIDTH + PADDING + run_column * (cell_width + PADDING)
-            value = value_for_csv(run_metrics.get(summary_metric, ""))
-            draw_text_centered(draw, (left, top, left + cell_width, top + metric_height), value, font)
+    if summary_metrics:
+        for row, summary_metric in enumerate(summary_metrics):
+            top = header_height + len(image_names) * (cell_height + PADDING) + row * METRIC_HEIGHT
+            metric_label = summary_metric.removeprefix("eval/")
+            draw_text_centered(draw, (0, top, LABEL_WIDTH, top + METRIC_HEIGHT), metric_label, font)
+            for run_column, run_metrics in enumerate(metrics, start=len(extra_images)):
+                left = LABEL_WIDTH + PADDING + run_column * (cell_width + PADDING)
+                value = value_for_csv(run_metrics.get(summary_metric, ""))
+                draw_text_centered(draw, (left, top, left + cell_width, top + METRIC_HEIGHT), value, font)
 
     canvas.save(image_file)
 
@@ -283,7 +295,7 @@ def main() -> None:
         print("Skipping Mueller-Brown CSV: no completed runs found.")
 
     image_comparisons = [
-        (ALDP_ROOT, ALDP_IMAGE_FILE, comparison["aldp"], ALDP_LANGEVIN_JS_DIVERGENCE),
+        (ALDP_ROOT, ALDP_IMAGE_FILE, comparison["aldp"], ALDP_SUMMARY_METRICS),
     ]
     if mueller_brown_csv_run_data and (
         mueller_brown_comparison := comparison.get("mueller_brown")
@@ -292,7 +304,7 @@ def main() -> None:
             (MUELLER_BROWN_ROOT, MUELLER_BROWN_IMAGE_FILE, mueller_brown_comparison, None)
         )
 
-    for root, image_file, image_comparison, summary_metric in image_comparisons:
+    for root, image_file, image_comparison, summary_metrics in image_comparisons:
         folders = image_comparison["folders"]
         image_metrics = image_comparison["metrics"]
         extra_columns = image_comparison.get("extra_col", {})
@@ -306,7 +318,7 @@ def main() -> None:
                 image_run_metrics,
                 image_metrics,
                 extra_columns,
-                summary_metric,
+                summary_metrics,
             )
 
 

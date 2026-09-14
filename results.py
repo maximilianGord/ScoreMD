@@ -19,8 +19,6 @@ MUELLER_BROWN_ROOT = Path("outputs/mueller_brown")
 COMPARISON_FILE = Path("comparison.json")
 ALDP_CSV_FILE = Path("results.csv")
 MUELLER_BROWN_CSV_FILE = Path("mueller_brown_results.csv")
-ALDP_IMAGE_FILE = Path("comparison_aldp.png")
-MUELLER_BROWN_IMAGE_FILE = Path("comparison_mueller_brown.png")
 PADDING = 12
 LABEL_WIDTH = 220
 HEADER_HEIGHT = 58
@@ -120,19 +118,24 @@ def plot_label(run_dir: Path, config: dict[str, Any], run: str) -> str:
 
 def run_details(root: Path, folder: str) -> tuple[Path, dict[str, str], dict[str, Any]]:
     run_dir = root / folder.strip()
-    with (run_dir / ".hydra" / "config.yaml").open() as file:
-        config = yaml.safe_load(file) or {}
+    config_path = run_dir / ".hydra" / "config.yaml"
+    if config_path.is_file():
+        with config_path.open() as file:
+            config = yaml.safe_load(file) or {}
+    else:
+        config = {}
     loss_type, tsm_type, sg_type = loss_settings(config)
     evaluation = config.get("evaluation", {})
+    missing_value = "?" if not config else ""
     details = {
         "folder": run_dir.name,
         "run": str(run_dir.relative_to(root)),
-        "coarse graining level": str(config.get("dataset", {}).get("coarse_graining_level", "")),
-        "loss type": loss_type,
-        "tsm type": tsm_type,
-        "sg type": sg_type,
-        "num langevin samples": str(evaluation.get("num_langevin_samples", "")),
-        "parallel trajectories": str(evaluation.get("num_parallel_langevin_samples", "")),
+        "coarse graining level": str(config.get("dataset", {}).get("coarse_graining_level", missing_value)),
+        "loss type": loss_type or missing_value,
+        "tsm type": tsm_type or missing_value,
+        "sg type": sg_type or missing_value,
+        "num langevin samples": str(evaluation.get("num_langevin_samples", missing_value)),
+        "parallel trajectories": str(evaluation.get("num_parallel_langevin_samples", missing_value)),
         "_plot_label": plot_label(run_dir, config, str(run_dir.relative_to(root))),
     }
     metric_path = next(
@@ -262,9 +265,11 @@ def main() -> None:
         for run_dir in sorted(ALDP_ROOT.glob("*/*"))
         if run_dir.is_dir() and (run_dir / "out").is_dir() and any((run_dir / "out").iterdir())
     ]
-    _, csv_details, csv_metrics = map(list, zip(*csv_run_data))
-    write_csv(ALDP_CSV_FILE, csv_details, csv_metrics)
-
+    if csv_run_data:
+        _, csv_details, csv_metrics = map(list, zip(*csv_run_data))
+        write_csv(ALDP_CSV_FILE, csv_details, csv_metrics)
+    else:
+        print("Skipping ALDP CSV: no runs with output found.")
     mueller_brown_csv_run_data = [
         run_details(MUELLER_BROWN_ROOT, str(run_dir.relative_to(MUELLER_BROWN_ROOT)))
         for run_dir in sorted(MUELLER_BROWN_ROOT.glob("*/*"))
@@ -282,20 +287,15 @@ def main() -> None:
     else:
         print("Skipping Mueller-Brown CSV: no completed runs found.")
 
-    image_comparisons = [
-        (ALDP_ROOT, ALDP_IMAGE_FILE, comparison["aldp"], ALDP_LANGEVIN_JS_DIVERGENCE),
-    ]
-    if mueller_brown_csv_run_data and (
-        mueller_brown_comparison := comparison.get("mueller_brown")
-    ):
-        image_comparisons.append(
-            (MUELLER_BROWN_ROOT, MUELLER_BROWN_IMAGE_FILE, mueller_brown_comparison, None)
-        )
-
-    for root, image_file, image_comparison, summary_metric in image_comparisons:
-        folders = image_comparison["folders"]
-        image_metrics = image_comparison["metrics"]
+    for _, image_comparison in sorted(comparison.items(), key=lambda item: int(item[0])):
+        name = str(image_comparison["name"])
+        display = str(image_comparison["display"])
+        root = Path("outputs") / name
+        image_file = Path(f"comparison_{display}.png")
+        folders = image_comparison.get("folders", [])
+        image_metrics = image_comparison.get("metrics", [])
         extra_columns = image_comparison.get("extra_col", {})
+        summary_metric = ALDP_LANGEVIN_JS_DIVERGENCE if name == "aldp" else None
         if folders and image_metrics:
             image_run_data = [run_details(root, folder) for folder in folders]
             image_run_dirs, image_details, image_run_metrics = map(list, zip(*image_run_data))

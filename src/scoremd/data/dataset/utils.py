@@ -239,8 +239,20 @@ def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict
         dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
     )
     coordinate_source = full_coordinates if full_coordinates is not None else datapoints.data
-    frame_shape = (-1, 3) if full_coordinates is not None else sample_shape
-    frames = np.asarray(coordinate_source, dtype=float).reshape((len(datapoints), *frame_shape))
+    coordinates = np.asarray(coordinate_source, dtype=float)
+    if full_coordinates is None:
+        frame_shape = sample_shape
+    elif coordinates.ndim > 2:
+        # Preserve an explicitly provided frame layout.
+        frame_shape = coordinates.shape[1:]
+    elif sample_shape and sample_shape[-1] == 3 and coordinates.shape[1] % 3 == 0:
+        # Molecular datasets retain flattened Cartesian full-atom frames.
+        frame_shape = (-1, 3)
+    else:
+        # Toy systems such as coarse-grained Mueller--Brown retain a flat
+        # coordinate vector (two coordinates), not Cartesian atom triples.
+        frame_shape = coordinates.shape[1:]
+    frames = coordinates.reshape((len(datapoints), *frame_shape))
     return compute_sigma_mode(frames, dataset.force, beta=1.0 / float(dataset.kbT), **kwargs)
 
 

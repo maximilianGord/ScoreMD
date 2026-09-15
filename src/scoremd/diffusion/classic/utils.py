@@ -89,6 +89,7 @@ def get_loss(
     sg_sigma_max: float = 0.01,
     t_0_lambda: float = 1.0,
     sc_switch: bool = False,
+    force_sigma_max: float = 0.01,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     kbT: float = 1.0,
@@ -466,7 +467,7 @@ def get_loss(
                     sigma_mode_sq=sigma_mode_sq,
                     reduce=reduce_op,
                 )
-                is_anchor = ts <= tsm_t0
+                is_anchor = std <= force_sigma_max
                 dsm_weight = jnp.where(is_anchor, kappas_anchor * lambdas_anchor, kappas_sg * lambdas_sg)
                 anchor_component = anchor_losses * (1 - kappas_anchor)
                 sc_component = sc_per_sample * (1 - kappas_sg)
@@ -478,7 +479,8 @@ def get_loss(
             elif sc_switch:
                 # Anchor (near t=0) and sc (semigroup consistency, t>0) are two different
                 # per-sample formulas, but share the same (sg_type, sg_lambda, sg_t0,
-                # sg_sigma_max) weight schedule; tsm_t0 decides which one applies per sample.
+                # sg_sigma_max) weight schedule; force_sigma_max decides which one applies
+                # per sample, based on the noise scale sigma_t rather than raw time.
                 anchor_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
@@ -515,7 +517,7 @@ def get_loss(
                     sigma_mode_sq=sigma_mode_sq,
                     reduce=reduce_op,
                 )
-                is_anchor = ts <= tsm_t0
+                is_anchor = std <= force_sigma_max
                 combined_per_sample = jnp.where(is_anchor, anchor_losses, sc_per_sample)
                 sc_loss = reduce_op(combined_per_sample)
                 if tsm_type != "mode_mixture":

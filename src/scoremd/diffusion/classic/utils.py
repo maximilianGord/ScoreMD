@@ -93,6 +93,7 @@ def get_loss(
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     kbT: float = 1.0,
+    delta_s: Optional[float] = None,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -108,6 +109,9 @@ def get_loss(
       beta: A float, the weight of the scalar field FP loss.
       gamma: A float, the weight of the diffusion loss.
       fp_dist: A string, the distribution to use for the FP loss. Can be 'pert' for perturbed data or 'x' for original data.
+      delta_s: For loss_type='sc', restricts the sampled semigroup time s to
+        [max(t_min, t - delta_s), t) instead of [t_min, t). None (default)
+        keeps the unrestricted [t_min, t) range.
         **kwargs: Additional keyword arguments that are passed to the FP loss.
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
@@ -422,7 +426,7 @@ def get_loss(
 
             s_rng, posterior_rng = jax.random.split(error_rng)
             #TODO change hard coded t_min to a parameter
-            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6)
+            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6, delta_s=delta_s)
             r_s = _vp_posterior_sample(posterior_rng, sde, batch, perturbed_data, s_vals, ts)
             teacher_score = teacher_score_fn(r_s, features, s_vals)
 
@@ -819,11 +823,17 @@ def _sample_s_before_t(
     rng: jax.random.PRNGKey,
     t: jnp.ndarray,
     t_min: float,
+    delta_s: Optional[float] = None,
 ) -> jnp.ndarray:
-    """Sample s ~ Uniform(t_min, t) elementwise, strictly below each t.
+    """Sample s ~ Uniform(lower, t) elementwise, strictly below each t.
+
+    ``lower`` is ``t_min`` by default. If ``delta_s`` is given, ``lower`` is
+    instead ``max(t_min, t - delta_s)``, restricting s to [t - delta_s, t)
+    so the semigroup gap t - s is capped at ``delta_s``.
 
     Requires t > t_min elementwise (guaranteed if t_min matches whatever
     lower bound was used to sample t itself upstream).
     """
+    lower = t_min if delta_s is None else jnp.maximum(t_min, t - delta_s)
     u = jax.random.uniform(rng, shape=t.shape, dtype=t.dtype)
-    return t_min + u * (t - t_min)
+    return lower + u * (t - lower)

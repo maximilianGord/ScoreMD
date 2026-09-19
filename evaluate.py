@@ -1313,10 +1313,13 @@ def evaluate_forces_aldp(
     plt.savefig(f"{out_dir}/forces_histogram.png", bbox_inches="tight")
     plt.close()
 
+    relative_force_error = ground_truth_forces / forces
+    finite_relative_force_error = relative_force_error[jnp.isfinite(relative_force_error)]
+
     plt.figure(clear=True)
     plt.title("Relative force error")
-    plt.hist(ground_truth_forces / forces, bins=100, density=True)
-    plt.axvline(jnp.mean(ground_truth_forces / forces), color="k", linestyle="dashed", linewidth=1)
+    plt.hist(finite_relative_force_error, bins=100, density=True)
+    plt.axvline(jnp.mean(finite_relative_force_error), color="k", linestyle="dashed", linewidth=1)
     plt.xlabel("Relative Force Error")
     plt.ylabel("Density")
     plt.savefig(f"{out_dir}/forces_error_histogram.png", bbox_inches="tight")
@@ -1328,7 +1331,7 @@ def evaluate_forces_aldp(
         wandb_lib.log(
             {
                 "eval/mean_abs_force_error": jnp.mean(jnp.abs(ground_truth_forces - forces)),
-                "eval/mean_relative_force_error": jnp.mean(ground_truth_forces / forces),
+                "eval/mean_relative_force_error": jnp.mean(finite_relative_force_error),
             }
         )
 

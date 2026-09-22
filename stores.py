@@ -141,6 +141,8 @@ def create_trainig_schedule_store(store):
         tsm_t0=0.05,
         tsm_sigma_max=0.01,
         tsm_force_contribution="absolute",
+        tsm_lambda_scheme="uniform",
+        sg_lambda_scheme="uniform",
         sigma_data=1.0,
         zen_partial=True,
         populate_full_signature=True,

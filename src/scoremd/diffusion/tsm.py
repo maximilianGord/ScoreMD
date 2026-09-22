@@ -145,8 +145,9 @@ def tsm_loss(
     tsm_sigma_max: float,
     tsm_force_contribution: TSMForceContribution = "absolute",
     sigma_data: float = 1.0,
-    sigma_mode_sq: Optional[float] = None,
+    sigma_mode_sq: Optional[ArrayLike] = None,
     kbT: float = 1.0,
+    lambda_scheme: LambdaScheme = "uniform",
     reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Compute a time-weighted target score matching loss.
@@ -160,7 +161,10 @@ def tsm_loss(
 
     ``sigma_data`` is the data standard deviation used by the mode-mixture
     schedule.  ``sigma_mode_sq`` optionally overrides its square when a local
-    mode variance is known.
+    mode variance is known -- either a scalar (one value for the whole run)
+    or a per-sample ``(batch,)`` array (e.g. ``mode_var_computation=
+    "gmm_per_sample"``); only the scalar case is eagerly validated for
+    positivity here.
 
     For regular schedules, this returns ``(loss, gamma_t)`` where ``gamma_t``
     is the configured TSM weight.  For ``mode_mixture``, it returns
@@ -207,7 +211,13 @@ def tsm_loss(
         alpha_t = jnp.exp(sde.log_mean_coeff(t))
         sigma_sq = jnp.square(sigma_t)
         if sigma_mode_sq is not None:
-            if sigma_mode_sq <= 0.0:
+            # sigma_mode_sq is either a scalar config constant or a per-sample (batch,)
+            # array (e.g. mode_var_computation="gmm_per_sample"); only the scalar case
+            # can be eagerly validated here without breaking under a per-sample array or
+            # a traced value (`if <array>` is ambiguous for more than one element, and
+            # per-sample values are already validated for positivity where they're
+            # computed, in compute_gmm_sigma_mode_per_sample).
+            if jnp.ndim(sigma_mode_sq) == 0 and sigma_mode_sq <= 0.0:
                 raise ValueError(f"sigma_mode_sq must be positive; got {sigma_mode_sq}.")
             sigma_data_sq = jnp.asarray(sigma_mode_sq, dtype=x.dtype)
         else:
@@ -216,7 +226,7 @@ def tsm_loss(
             sigma_data_sq = jnp.square(jnp.asarray(sigma_data, dtype=x.dtype))
 
         kappa_t = sigma_sq / jnp.maximum(sigma_sq + jnp.square(alpha_t) * sigma_data_sq, 1e-12)
-        lambda_t = _optimal_tsm_lambda(sigma_sq, sigma_data_sq)
+        lambda_t = _optimal_tsm_lambda(sigma_sq, sigma_data_sq, alpha_sq=jnp.square(alpha_t), scheme=lambda_scheme)
         weighted_loss = time_weights * lambda_t  * loss_per_sample
         return weighted_loss, kappa_t, lambda_t
 
@@ -239,7 +249,8 @@ def semigroup_consistency_loss(
     sg_t0: float,
     sg_sigma_max: float,
     sigma_data: float = 1.0,
-    sigma_mode_sq: Optional[float] = None,
+    sigma_mode_sq: Optional[ArrayLike] = None,
+    lambda_scheme: LambdaScheme = "uniform",
     reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Compute the score-semigroup consistency loss L_SG.
@@ -297,7 +308,9 @@ def semigroup_consistency_loss(
         kappa_st = b_sq_t_given_s / jnp.maximum(
             b_sq_t_given_s + jnp.square(a_t_given_s) * sigma_data_sq, 1e-12
         )
-        lambda_st = _optimal_tsm_lambda(b_sq_t_given_s, sigma_data_sq)
+        lambda_st = _optimal_tsm_lambda(
+            b_sq_t_given_s, sigma_data_sq, alpha_sq=jnp.square(a_t_given_s), scheme=lambda_scheme
+        )
         weighted_loss = jnp.where(valid, time_weights * lambda_st * loss_per_sample, jnp.nan)
         return weighted_loss, kappa_st, lambda_st
 

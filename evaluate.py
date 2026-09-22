@@ -50,6 +50,8 @@ class EvaluationSettings:
     aldp_evaluate_forces: bool = True  # Whether to evaluate the forces of the model
     limit_inference_peptides: Optional[Sequence[str]] = None  # If specified, only evaluate on these peptides
     only_store_results: bool = False  # If this is true, we only store the results with minimal evaluation.
+    run_full_iid_eval: bool = True  # Whether to run the traditional iid sample evaluation (denoising fully to t=0)
+    partial_denoise_eval_ts: Sequence[float] = ()  # Additional times to stop the reverse diffusion at (e.g. (0.1, 0.05, 0.01)) for partial-denoise iid sample evaluation
 
 
 def evaluate(
@@ -148,7 +150,7 @@ def evaluate(
             if evaluation.num_iid_samples is None
             else evaluation.num_iid_samples
         )
-        if num_samples > 0:
+        if num_samples > 0 and evaluation.run_full_iid_eval:
             metrics |= evaluate_molecule_samples(
                 dataset,
                 dataset.train.data,
@@ -165,6 +167,26 @@ def evaluate(
                 evaluation.seed,
                 only_store_results=evaluation.only_store_results,
             )
+
+        for partial_denoise_t0 in evaluation.partial_denoise_eval_ts:
+            if num_samples > 0:
+                metrics |= evaluate_molecule_samples(
+                    dataset,
+                    dataset.train.data,
+                    dataset.train.data[0].reshape(dataset.sample_shape),
+                    None,
+                    trained_unnormalized_score,
+                    norm_factor,
+                    inference_bs,
+                    num_samples,
+                    None,
+                    wandb,
+                    f"aldp_partial_denoise_t0_{partial_denoise_t0}",
+                    out_dir,
+                    evaluation.seed,
+                    only_store_results=evaluation.only_store_results,
+                    sampling_t0=partial_denoise_t0,
+                )
 
         if evaluation.aldp_evaluate_forces:
             metrics |= evaluate_forces_aldp(dataset, force, inference_bs, wandb, out_dir)
@@ -285,19 +307,25 @@ def evaluate(
     if wandb and len(metrics) > 0:
         wandb_lib.log(metrics)
 
-    # write metrics to file
-    with open(os.path.join(out_dir, "metrics.json"), "w") as f:
-        # Skip values that are not JSON serializable
-        serializable_metrics = {}
-        for key, value in metrics.items():
-            try:
-                # Test if the value is JSON serializable
-                json.dumps({key: value})
-                serializable_metrics[key] = value
-            except (TypeError, OverflowError):
-                log.warning(f"Skipping non-serializable metric: {key}")
+    # write metrics to file, merging with any metrics already present so that a
+    # partial rerun (e.g. only recomputing the partial-denoise metrics) does not
+    # discard metrics computed by a previous, more complete run.
+    metrics_path = os.path.join(out_dir, "metrics.json")
+    merged_metrics = {}
+    if os.path.exists(metrics_path):
+        with open(metrics_path, "r") as f:
+            merged_metrics = json.load(f)
 
-        json.dump(serializable_metrics, f)
+    for key, value in metrics.items():
+        try:
+            # Test if the value is JSON serializable
+            json.dumps({key: value})
+            merged_metrics[key] = value
+        except (TypeError, OverflowError):
+            log.warning(f"Skipping non-serializable metric: {key}")
+
+    with open(metrics_path, "w") as f:
+        json.dump(merged_metrics, f)
 
     log.info(f"Metrics: {metrics}")
     log.info(f"Finished evaluation. You can find the results in {out_dir}")
@@ -1249,6 +1277,7 @@ def evaluate_molecule_samples(
     out_dir: str,
     seed: int,
     only_store_results: bool = False,
+    sampling_t0: float = 0.0,
 ) -> dict:
     if not only_store_results:
         plt.figure(clear=True)
@@ -1264,6 +1293,7 @@ def evaluate_molecule_samples(
         norm_factor=norm_factor,
         BS=inference_bs,
         seed=seed,
+        t0=sampling_t0,
     ).reshape(-1, *dataset.sample_shape)
     q_samples, _ = kabsch_align_many(q_samples, reference_sample)
     onp.save(f"{out_dir}/{prefix}_iid_samples.npy", q_samples)

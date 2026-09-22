@@ -12,6 +12,7 @@ class Datapoints(struct.PyTreeNode):
     data: jnp.ndarray
     features: Optional[jnp.ndarray]
     forces: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
+    sigma_mode_sq: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.data.ndim != 2:
@@ -28,6 +29,12 @@ class Datapoints(struct.PyTreeNode):
                 raise ValueError(
                     f"forces must have the same shape as data; got {self.forces.shape} and {self.data.shape}."
                 )
+        if self.sigma_mode_sq is not None:
+            if self.sigma_mode_sq.shape != (self.data.shape[0],):
+                raise ValueError(
+                    "sigma_mode_sq must have shape (num_samples,); got "
+                    f"{self.sigma_mode_sq.shape} for data shape {self.data.shape}."
+                )
 
     def __len__(self):
         return self.data.shape[0]
@@ -37,6 +44,7 @@ class Datapoints(struct.PyTreeNode):
             self.data[idx],
             self.features[idx] if self.features is not None else None,
             forces=self.forces[idx] if self.forces is not None else None,
+            sigma_mode_sq=self.sigma_mode_sq[idx] if self.sigma_mode_sq is not None else None,
         )
 
 

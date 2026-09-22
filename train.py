@@ -164,6 +164,7 @@ def _prepare_tsm_inputs(
             raise ValueError("Mode-mixture TSM requires a scalar coordinate norm_factor.")
         # Must run before _precompute_forces releases ALDP's retained full frames.
         mode_var_computation = getattr(dataset, "mode_var_computation", "data_hessian")
+        per_sample_mode_var = mode_var_computation == "gmm_per_sample"
         if mode_var_computation == "potential":
             if not isinstance(dataset, MuellerBrownSimulation):
                 raise ValueError("dataset.mode_var_computation=potential is only supported for Müller-Brown.")
@@ -190,23 +191,57 @@ def _prepare_tsm_inputs(
                 return_diagnostics=True,
             )
             diagnostics = {"source": "data", "estimator": "gaussian_mixture", **diagnostics}
+        elif mode_var_computation == "gmm_per_sample":
+            from scoremd.data.dataset.utils import compute_gmm_sigma_mode_per_sample
+
+            train_sigma_mode_sq, val_sigma_mode_sq, diagnostics = compute_gmm_sigma_mode_per_sample(
+                train_data.data,
+                val_data=val_data.data if val_data is not None else None,
+                n_components=getattr(dataset, "gmm_n_components", None),
+                covariance_type=getattr(dataset, "gmm_covariance_type", "full"),
+                block_size=getattr(dataset, "gmm_block_size", None),
+                return_diagnostics=True,
+            )
+            diagnostics = {"source": "data", "estimator": "gaussian_mixture_per_sample", **diagnostics}
         else:
             raise ValueError(
                 "dataset.mode_var_computation must be 'potential', 'data_hessian', 'data_empirical', "
-                "'cg_local_covariance', or 'gmm'; "
+                "'cg_local_covariance', 'gmm', or 'gmm_per_sample'; "
                 f"got {mode_var_computation!r}."
             )
-        sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
-        log.info(
-            "Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; "
-            "mode_var_computation=%s; diagnostics=%s",
-            sigma_mode_sq,
-            sigma_mode_sq_normalized,
-            mode_var_computation,
-            diagnostics,
-        )
-        for ranged_loss in mode_mixture_losses:
-            _set_runtime_loss_options(ranged_loss, sigma_mode_sq=sigma_mode_sq_normalized, kbT=float(dataset.kbT))
+
+        if per_sample_mode_var:
+            norm_factor_sq = float(np.asarray(norm_factor) ** 2)
+            train_sigma_mode_sq_normalized = norm_factor_sq * np.asarray(train_sigma_mode_sq)
+            train_data = train_data.replace(sigma_mode_sq=jnp.asarray(train_sigma_mode_sq_normalized))
+            if val_data is not None and val_sigma_mode_sq is not None:
+                val_sigma_mode_sq_normalized = norm_factor_sq * np.asarray(val_sigma_mode_sq)
+                val_data = val_data.replace(sigma_mode_sq=jnp.asarray(val_sigma_mode_sq_normalized))
+            log.info(
+                "Computed physical sigma_mode_sq=%g (per-sample mean, std=%g); "
+                "normalized sigma_mode_sq=%g (per-sample mean, std=%g); "
+                "mode_var_computation=%s; diagnostics=%s",
+                float(np.mean(train_sigma_mode_sq)),
+                float(np.std(train_sigma_mode_sq)),
+                float(np.mean(train_sigma_mode_sq_normalized)),
+                float(np.std(train_sigma_mode_sq_normalized)),
+                mode_var_computation,
+                diagnostics,
+            )
+            for ranged_loss in mode_mixture_losses:
+                _set_runtime_loss_options(ranged_loss, kbT=float(dataset.kbT))
+        else:
+            sigma_mode_sq_normalized = float(np.asarray(norm_factor) ** 2 * sigma_mode_sq)
+            log.info(
+                "Computed physical sigma_mode_sq=%g; normalized sigma_mode_sq=%g; "
+                "mode_var_computation=%s; diagnostics=%s",
+                sigma_mode_sq,
+                sigma_mode_sq_normalized,
+                mode_var_computation,
+                diagnostics,
+            )
+            for ranged_loss in mode_mixture_losses:
+                _set_runtime_loss_options(ranged_loss, sigma_mode_sq=sigma_mode_sq_normalized, kbT=float(dataset.kbT))
 
     train_data = _precompute_forces(dataset, train_data)
     val_data = _precompute_forces(dataset, val_data)

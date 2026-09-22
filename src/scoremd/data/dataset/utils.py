@@ -1,6 +1,6 @@
 import os
 from os import PathLike
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 import jax.numpy as jnp
 import numpy as np
@@ -365,24 +365,58 @@ def _partition_into_blocks(n_coords: int, block_size: int, coords_per_atom: int 
     return blocks
 
 
+def _block_log_probs(X: Array, weights: Array, means: Array, covariances: Array, blocks: list[Array]) -> Array:
+    """log(weight_k * density_k(x)) for a block-diagonal-covariance mixture, per sample per component.
+
+    Shared between fitting (to score the training log-likelihood for BIC) and
+    :meth:`_BlockDiagonalGMM.predict_proba` (to score arbitrary new samples,
+    e.g. a held-out validation set, against an already-fitted mixture).
+    """
+    from scipy.stats import multivariate_normal
+
+    n_components = len(weights)
+    log_probs = np.zeros((X.shape[0], n_components))
+    for k in range(n_components):
+        block_log_density = np.zeros(X.shape[0])
+        for block in blocks:
+            block_log_density += multivariate_normal.logpdf(
+                X[:, block], mean=means[k, block], cov=covariances[k][np.ix_(block, block)], allow_singular=True
+            )
+        log_probs[:, k] = np.log(np.maximum(weights[k], np.finfo(float).tiny)) + block_log_density
+    return log_probs
+
+
 class _BlockDiagonalGMM:
     """Minimal ``GaussianMixture``-like result for a block-diagonal-covariance fit.
 
     Exposes just enough of sklearn's ``GaussianMixture`` interface
-    (``n_components``, ``weights_``, ``covariances_``, ``bic``) for
-    :func:`compute_gmm_sigma_mode`'s k-selection loop to treat it the same as
-    a real ``GaussianMixture``.
+    (``n_components``, ``weights_``, ``covariances_``, ``bic``, ``predict_proba``)
+    for :func:`compute_gmm_sigma_mode`'s k-selection loop and
+    :func:`compute_gmm_sigma_mode_per_sample`'s responsibility computation to
+    treat it the same as a real ``GaussianMixture``.
     """
 
-    def __init__(self, weights: Array, covariances: Array, bic_value: float):
+    def __init__(self, weights: Array, covariances: Array, bic_value: float, *, means: Array, blocks: list[Array]):
         self.n_components = len(weights)
         self.weights_ = weights
         self.covariances_ = covariances  # (n_components, d, d); zero outside each block
+        self.means_ = means
+        self._blocks = blocks
         self._bic_value = bic_value
 
     def bic(self, X: Array) -> float:
         del X
         return self._bic_value
+
+    def predict_proba(self, X: Array) -> Array:
+        """Posterior responsibility of each component for each row of X."""
+        from scipy.special import logsumexp
+
+        log_probs = _block_log_probs(
+            np.asarray(X, dtype=float), self.weights_, self.means_, self.covariances_, self._blocks
+        )
+        log_norm = logsumexp(log_probs, axis=1, keepdims=True)
+        return np.exp(log_probs - log_norm)
 
 
 def _fit_block_diagonal_gmm(
@@ -406,7 +440,6 @@ def _fit_block_diagonal_gmm(
     """
     from sklearn.mixture import GaussianMixture
     from scipy.special import logsumexp
-    from scipy.stats import multivariate_normal
 
     seed_gmm = GaussianMixture(
         n_components=n_components,
@@ -423,26 +456,96 @@ def _fit_block_diagonal_gmm(
 
     n_coords = flattened.shape[1]
     covariances = np.zeros((n_components, n_coords, n_coords))
-    log_probs = np.zeros((flattened.shape[0], n_components))
     for k in range(n_components):
         diff = flattened - means[k]
         weighted_diff = diff * resp[:, k, None]
-        block_log_density = np.zeros(flattened.shape[0])
         for block in blocks:
             block_cov = (weighted_diff[:, block].T @ diff[:, block]) / n_k[k]
             block_cov.flat[:: len(block) + 1] += reg_covar
             covariances[k][np.ix_(block, block)] = block_cov
-            block_log_density += multivariate_normal.logpdf(
-                flattened[:, block], mean=means[k, block], cov=block_cov, allow_singular=True
-            )
-        log_probs[:, k] = np.log(np.maximum(weights[k], np.finfo(float).tiny)) + block_log_density
 
+    log_probs = _block_log_probs(flattened, weights, means, covariances, blocks)
     log_likelihood = float(np.sum(logsumexp(log_probs, axis=1)))
     n_block_cov_params = sum(len(block) * (len(block) + 1) // 2 for block in blocks)
     n_params = (n_components - 1) + n_components * n_coords + n_components * n_block_cov_params
     bic = -2.0 * log_likelihood + n_params * np.log(flattened.shape[0])
 
-    return _BlockDiagonalGMM(weights, covariances, bic)
+    return _BlockDiagonalGMM(weights, covariances, bic, means=means, blocks=blocks)
+
+
+def _validate_gmm_args(
+    flattened: Array,
+    *,
+    max_components: int,
+    covariance_type: str,
+    block_size: Optional[int],
+    coords_per_atom: int,
+) -> Optional[list[Array]]:
+    """Shared validation for :func:`compute_gmm_sigma_mode` and its per-sample variant.
+
+    Returns the block partition (or ``None`` for non-block covariance types).
+    """
+    if flattened.shape[0] < 2:
+        raise ValueError("data must contain at least two frames.")
+    if max_components <= 0:
+        raise ValueError("max_components must be positive.")
+    if covariance_type not in ("full", "diag", "spherical", "block"):
+        raise ValueError(
+            f"Unsupported covariance_type={covariance_type!r}; use 'full', 'diag', 'spherical', or 'block'."
+        )
+    if covariance_type != "block":
+        return None
+    if block_size is None:
+        raise ValueError("block_size (number of atoms per block) is required when covariance_type='block'.")
+    return _partition_into_blocks(flattened.shape[1], block_size, coords_per_atom=coords_per_atom)
+
+
+def _fit_gmm_with_selection(
+    flattened: Array,
+    *,
+    n_components: Optional[int],
+    max_components: int,
+    covariance_type: str,
+    blocks: Optional[list[Array]],
+    reg_covar: float,
+    n_init: int,
+    seed: Optional[int],
+) -> tuple[Any, dict[int, float]]:
+    """Fit a Gaussian mixture, selecting ``n_components`` by BIC when not given.
+
+    Shared by :func:`compute_gmm_sigma_mode` and
+    :func:`compute_gmm_sigma_mode_per_sample` so both estimators are fit
+    identically and only differ in how they collapse components to a scalar.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    def _fit(k: int):
+        if covariance_type == "block":
+            return _fit_block_diagonal_gmm(flattened, k, blocks, reg_covar=reg_covar, n_init=n_init, seed=seed)
+        return GaussianMixture(
+            n_components=k,
+            covariance_type=covariance_type,
+            reg_covar=reg_covar,
+            n_init=n_init,
+            random_state=seed,
+        ).fit(flattened)
+
+    bic_by_k: dict[int, float] = {}
+    if n_components is None:
+        candidates = range(1, max(1, min(max_components, flattened.shape[0] - 1)) + 1)
+        best_gmm = None
+        for k in candidates:
+            gmm = _fit(k)
+            bic_by_k[k] = float(gmm.bic(flattened))
+            if best_gmm is None or bic_by_k[k] < bic_by_k[best_gmm.n_components]:
+                best_gmm = gmm
+        gmm = best_gmm
+    else:
+        if n_components <= 0:
+            raise ValueError("n_components must be positive.")
+        gmm = _fit(n_components)
+        bic_by_k[n_components] = float(gmm.bic(flattened))
+    return gmm, bic_by_k
 
 
 def compute_gmm_sigma_mode(
@@ -482,50 +585,22 @@ def compute_gmm_sigma_mode(
     by BIC over ``1..max_components``. ``data`` may have any trailing shape;
     it is flattened per frame before fitting.
     """
-    from sklearn.mixture import GaussianMixture
-
     flattened = np.asarray(data, dtype=float).reshape((np.asarray(data).shape[0], -1))
-    if flattened.shape[0] < 2:
-        raise ValueError("data must contain at least two frames.")
-    if max_components <= 0:
-        raise ValueError("max_components must be positive.")
-    if covariance_type not in ("full", "diag", "spherical", "block"):
-        raise ValueError(
-            f"Unsupported covariance_type={covariance_type!r}; use 'full', 'diag', 'spherical', or 'block'."
-        )
+    blocks = _validate_gmm_args(
+        flattened, max_components=max_components, covariance_type=covariance_type,
+        block_size=block_size, coords_per_atom=coords_per_atom,
+    )
 
-    blocks: Optional[list[Array]] = None
-    if covariance_type == "block":
-        if block_size is None:
-            raise ValueError("block_size (number of atoms per block) is required when covariance_type='block'.")
-        blocks = _partition_into_blocks(flattened.shape[1], block_size, coords_per_atom=coords_per_atom)
-
-    def _fit(k: int):
-        if covariance_type == "block":
-            return _fit_block_diagonal_gmm(flattened, k, blocks, reg_covar=reg_covar, n_init=n_init, seed=seed)
-        return GaussianMixture(
-            n_components=k,
-            covariance_type=covariance_type,
-            reg_covar=reg_covar,
-            n_init=n_init,
-            random_state=seed,
-        ).fit(flattened)
-
-    bic_by_k: dict[int, float] = {}
-    if n_components is None:
-        candidates = range(1, max(1, min(max_components, flattened.shape[0] - 1)) + 1)
-        best_gmm = None
-        for k in candidates:
-            gmm = _fit(k)
-            bic_by_k[k] = float(gmm.bic(flattened))
-            if best_gmm is None or bic_by_k[k] < bic_by_k[best_gmm.n_components]:
-                best_gmm = gmm
-        gmm = best_gmm
-    else:
-        if n_components <= 0:
-            raise ValueError("n_components must be positive.")
-        gmm = _fit(n_components)
-        bic_by_k[n_components] = float(gmm.bic(flattened))
+    gmm, bic_by_k = _fit_gmm_with_selection(
+        flattened,
+        n_components=n_components,
+        max_components=max_components,
+        covariance_type=covariance_type,
+        blocks=blocks,
+        reg_covar=reg_covar,
+        n_init=n_init,
+        seed=seed,
+    )
 
     scale_covariance_type = "full" if covariance_type == "block" else covariance_type
     component_scales = np.asarray(
@@ -550,3 +625,91 @@ def compute_gmm_sigma_mode(
         diagnostics["block_size"] = int(block_size)
         diagnostics["n_blocks"] = len(blocks)
     return estimate, diagnostics
+
+
+def compute_gmm_sigma_mode_per_sample(
+    data: Array,
+    *,
+    val_data: Optional[Array] = None,
+    n_components: Optional[int] = None,
+    max_components: int = 8,
+    covariance_type: str = "full",
+    block_size: Optional[int] = None,
+    coords_per_atom: int = 3,
+    reg_covar: float = 1e-6,
+    n_init: int = 5,
+    seed: Optional[int] = 0,
+    return_diagnostics: bool = False,
+) -> (
+    tuple[Array, Optional[Array]]
+    | tuple[Array, Optional[Array], dict[str, Any]]
+):
+    """Assign each frame its own basin-specific mode variance via GMM responsibilities.
+
+    Fits a Gaussian mixture to ``data`` exactly like :func:`compute_gmm_sigma_mode`
+    (same fitting/model-selection code, so the two are directly comparable),
+    but instead of collapsing components with the mixture's global weights, it
+    scores each frame against the fitted mixture with ``predict_proba`` and
+    takes the responsibility-weighted average of the per-component scales:
+
+        sigma_mode_sq[i] = sum_k( predict_proba(x_i)_k * component_scale_k )
+
+    This is a soft assignment: a frame deep inside one basin gets essentially
+    that basin's scale, while a frame near a boundary between basins gets a
+    smooth blend of their scales rather than a discontinuous jump.
+
+    ``val_data``, if given, is scored against the *same* fitted mixture
+    (never refit) so validation frames are assigned responsibilities over the
+    same basins as the training frames, and returned as the second element.
+    """
+    flattened = np.asarray(data, dtype=float).reshape((np.asarray(data).shape[0], -1))
+    blocks = _validate_gmm_args(
+        flattened, max_components=max_components, covariance_type=covariance_type,
+        block_size=block_size, coords_per_atom=coords_per_atom,
+    )
+
+    gmm, bic_by_k = _fit_gmm_with_selection(
+        flattened,
+        n_components=n_components,
+        max_components=max_components,
+        covariance_type=covariance_type,
+        blocks=blocks,
+        reg_covar=reg_covar,
+        n_init=n_init,
+        seed=seed,
+    )
+
+    scale_covariance_type = "full" if covariance_type == "block" else covariance_type
+    component_scales = np.asarray(
+        [_component_scale(gmm.covariances_[k], scale_covariance_type) for k in range(gmm.n_components)]
+    )
+    weights = np.asarray(gmm.weights_)
+
+    resp_train = gmm.predict_proba(flattened)  # (n_train, n_components)
+    train_estimate = resp_train @ component_scales
+    if not np.all(np.isfinite(train_estimate)) or np.any(train_estimate <= 0.0):
+        raise ValueError("GMM per-sample mode-variance estimate is non-positive or non-finite.")
+
+    val_estimate: Optional[Array] = None
+    if val_data is not None:
+        flattened_val = np.asarray(val_data, dtype=float).reshape((np.asarray(val_data).shape[0], -1))
+        resp_val = gmm.predict_proba(flattened_val)
+        val_estimate = resp_val @ component_scales
+        if not np.all(np.isfinite(val_estimate)) or np.any(val_estimate <= 0.0):
+            raise ValueError("GMM per-sample mode-variance estimate (val) is non-positive or non-finite.")
+
+    if not return_diagnostics:
+        return train_estimate, val_estimate
+
+    diagnostics: dict[str, Any] = {
+        "n_components": int(gmm.n_components),
+        "bic_by_k": bic_by_k,
+        "component_weights": weights.tolist(),
+        "component_scale": component_scales.tolist(),
+        "covariance_type": covariance_type,
+        "train_mean_responsibility": resp_train.mean(axis=0).tolist(),
+    }
+    if covariance_type == "block":
+        diagnostics["block_size"] = int(block_size)
+        diagnostics["n_blocks"] = len(blocks)
+    return train_estimate, val_estimate, diagnostics

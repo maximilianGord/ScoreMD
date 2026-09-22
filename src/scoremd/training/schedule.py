@@ -105,6 +105,7 @@ class TrainingSchedule(abc.ABC):
         is_special_epoch: bool,
         validation: bool,
         key: ArrayLike,
+        sigma_mode_sq: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         """Use this train step when you have no clue about the ordering of t and it could be that each loss function needs to be called on it."""
 
@@ -117,14 +118,31 @@ class TrainingSchedule(abc.ABC):
             forces: Optional[ArrayLike],
             ts: ArrayLike,
             is_special_epoch: bool,
+            *,
+            sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
         ) -> Tuple[ArrayLike, ArrayLike]:
+            # `_train_step_single_loss` always calls its `loss_fn` with a
+            # `sigma_mode_sq_per_sample` kwarg; accepted here for call
+            # compatibility, but the per-sub-loss calls below use `sigma_mode_sq`
+            # (this function's own closed-over argument) directly instead.
+            del sigma_mode_sq_per_sample
             # return loss_fns[0](params, key, batch, ts)
             sum_loss, sum_aux = 0.0, jnp.zeros(5)
             for (t1, t0), loss_fn in zip(self.training_ranges(), loss_fns):
                 loss_match = jnp.any((ts < t1) & (ts > t0))
                 cur_loss, cur_aux = jax.lax.cond(
                     loss_match,
-                    lambda: loss_fn(params, teacher_params, key, batch, features, forces, ts, is_special_epoch),
+                    lambda: loss_fn(
+                        params,
+                        teacher_params,
+                        key,
+                        batch,
+                        features,
+                        forces,
+                        ts,
+                        is_special_epoch,
+                        sigma_mode_sq_per_sample=sigma_mode_sq,
+                    ),
                     lambda: (jnp.sum(jnp.zeros(5)), jnp.zeros(5)),
                 )
 
@@ -133,7 +151,7 @@ class TrainingSchedule(abc.ABC):
             return sum_loss, sum_aux
 
         return TrainingSchedule._train_step_single_loss(
-            merged_loss, state, batch, features, forces, ts, is_special_epoch, validation, key
+            merged_loss, state, batch, features, forces, ts, is_special_epoch, validation, key, sigma_mode_sq
         )
 
     @staticmethod
@@ -147,12 +165,33 @@ class TrainingSchedule(abc.ABC):
         is_special_epoch: bool,
         validation: bool,
         key: ArrayLike,
+        sigma_mode_sq: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
-            _, loss = loss_fn(state.params, state.ema_params, key, batch, features, forces, ts, is_special_epoch, False)
+            _, loss = loss_fn(
+                state.params,
+                state.ema_params,
+                key,
+                batch,
+                features,
+                forces,
+                ts,
+                is_special_epoch,
+                False,
+                sigma_mode_sq_per_sample=sigma_mode_sq,
+            )
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            state.params, state.ema_params, key, batch, features, forces, ts, is_special_epoch, True
+            state.params,
+            state.ema_params,
+            key,
+            batch,
+            features,
+            forces,
+            ts,
+            is_special_epoch,
+            True,
+            sigma_mode_sq_per_sample=sigma_mode_sq,
         )
 
         state = state.apply_gradients(grads=grads)
@@ -188,12 +227,17 @@ class TrainingSchedule(abc.ABC):
             current_data = datapoints.data[perm, ...]
             current_features = datapoints.features[perm, ...] if datapoints.features is not None else None
             current_forces = datapoints.forces[perm, ...] if datapoints.forces is not None else None
+            current_sigma_mode_sq = (
+                datapoints.sigma_mode_sq[perm, ...] if datapoints.sigma_mode_sq is not None else None
+            )
             if data_sharding is not None:
                 current_data = jax.lax.with_sharding_constraint(current_data, data_sharding)
                 if current_features is not None:
                     current_features = jax.lax.with_sharding_constraint(current_features, data_sharding)
                 if current_forces is not None:
                     current_forces = jax.lax.with_sharding_constraint(current_forces, data_sharding)
+                if current_sigma_mode_sq is not None:
+                    current_sigma_mode_sq = jax.lax.with_sharding_constraint(current_sigma_mode_sq, data_sharding)
 
             # augment the data (e.g., random rotations)
             current_data = self.augment(current_data, current_features, augment_key)
@@ -222,6 +266,7 @@ class TrainingSchedule(abc.ABC):
                         is_special_epoch,
                         validation,
                         step_key,
+                        current_sigma_mode_sq,
                     )
                 else:
                     state, cur_loss = self._mixed_t_train_step(
@@ -234,6 +279,7 @@ class TrainingSchedule(abc.ABC):
                         is_special_epoch,
                         validation,
                         step_key,
+                        current_sigma_mode_sq,
                     )
                 cur_losses.append(cur_loss)
 

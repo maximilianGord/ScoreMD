@@ -41,7 +41,9 @@ class ALDPDataset(Dataset):
     test: bool = False
     path: Optional[PathLike] = None  # Can be used to load a custom dataset
     seed: int = 0
-    mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance", "gmm"] = "data_hessian"
+    mode_var_computation: Literal[
+        "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+    ] = "data_hessian"
     gmm_n_components: Optional[int] = None
     gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full"
     gmm_block_size: Optional[int] = None
@@ -54,16 +56,20 @@ class ALDPDataset(Dataset):
         limit_samples: Optional[int] = None,
         validation: bool = True,
         seed: int = 0,
-        mode_var_computation: Literal["data_hessian", "data_empirical", "cg_local_covariance", "gmm"] = "data_hessian",
+        mode_var_computation: Literal[
+            "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+        ] = "data_hessian",
         gmm_n_components: Optional[int] = None,
         gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full",
         gmm_block_size: Optional[int] = None,
         name="aldp",
     ):
-        if mode_var_computation not in {"data_hessian", "data_empirical", "cg_local_covariance", "gmm"}:
+        if mode_var_computation not in {
+            "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+        }:
             raise ValueError(
                 "mode_var_computation must be 'data_hessian', 'data_empirical', "
-                f"'cg_local_covariance', or 'gmm'; got {mode_var_computation!r}."
+                f"'cg_local_covariance', 'gmm', or 'gmm_per_sample'; got {mode_var_computation!r}."
             )
         if gmm_n_components is not None and gmm_n_components <= 0:
             raise ValueError(f"gmm_n_components must be positive or None; got {gmm_n_components!r}.")

@@ -83,10 +83,12 @@ def get_loss(
     tsm_t0: float = 0.05,
     tsm_sigma_max: float = 0.01,
     tsm_force_contribution: str = "absolute",
+    tsm_lambda_scheme: str = "uniform",
     sg_type: str = "constant",
     sg_lambda: float = 1.0,
     sg_t0: float = 0.05,
     sg_sigma_max: float = 0.01,
+    sg_lambda_scheme: str = "uniform",
     t_0_lambda: float = 1.0,
     sc_switch: bool = False,
     force_sigma_max: float = 0.01,
@@ -95,6 +97,7 @@ def get_loss(
     sigma_mode_sq: Optional[float] = None,
     lambda_scheme: str = "uniform",
     kbT: float = 1.0,
+    delta_s: Optional[float] = None,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -110,6 +113,17 @@ def get_loss(
       beta: A float, the weight of the scalar field FP loss.
       gamma: A float, the weight of the diffusion loss.
       fp_dist: A string, the distribution to use for the FP loss. Can be 'pert' for perturbed data or 'x' for original data.
+      delta_s: For loss_type='sc', restricts the sampled semigroup time s to
+        [max(t_min, t - delta_s), t) instead of [t_min, t). None (default)
+        keeps the unrestricted [t_min, t) range.
+
+    The returned loss function also accepts a keyword-only
+    ``sigma_mode_sq_per_sample`` argument (a per-batch-sample array, sliced
+    from ``Datapoints.sigma_mode_sq``, e.g. for
+    ``dataset.mode_var_computation="gmm_per_sample"``). When given, it
+    overrides the scalar ``sigma_mode_sq`` above for every mode_mixture
+    computation in this call; when ``None`` (the default), the scalar is
+    used as before.
         **kwargs: Additional keyword arguments that are passed to the FP loss.
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
@@ -123,6 +137,11 @@ def get_loss(
         raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
     if loss_type == "sc" and sg_type not in valid_matching_types:
         raise ValueError(f"Unknown sg_type={sg_type!r}.")
+    valid_lambda_schemes = ("song", "dsm_optimal", "tsm_optimal", "uniform")
+    if tsm_type == "mode_mixture" and tsm_lambda_scheme not in valid_lambda_schemes:
+        raise ValueError(f"Unknown tsm_lambda_scheme={tsm_lambda_scheme!r}.")
+    if sg_type == "mode_mixture" and sg_lambda_scheme not in valid_lambda_schemes:
+        raise ValueError(f"Unknown sg_lambda_scheme={sg_lambda_scheme!r}.")
     log.info("Using VP-SDE")
     from scoremd.diffusion.classic.sde import VP
     from scoremd.diffusion.tsm import semigroup_consistency_loss, tsm_loss
@@ -143,7 +162,13 @@ def get_loss(
         ts: ArrayLike,
         is_special_epoch: bool,
         training: bool,
+        *,
+        sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
     ) -> Sequence[ArrayLike]:
+        # Per-sample sigma_mode_sq (e.g. mode_var_computation="gmm_per_sample") overrides
+        # the scalar `sigma_mode_sq` config value when supplied by the caller; otherwise
+        # every mode_mixture computation below falls back to the scalar as before.
+        effective_sigma_mode_sq = sigma_mode_sq if sigma_mode_sq_per_sample is None else sigma_mode_sq_per_sample
         rng, error_rng, dropout_rng = jax.random.split(rng, 3)
         score_fn = get_score(model, params, training, evaluated_models, rngs={"dropout": dropout_rng})
         teacher_score_fn = get_score(model, teacher_params, False, evaluated_models)
@@ -304,9 +329,9 @@ def get_loss(
                     tsm_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
+                    lambda_scheme=tsm_lambda_scheme,
                     reduce=reduce_op,
                 )
                 #combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
@@ -330,8 +355,7 @@ def get_loss(
                     tsm_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -367,8 +391,7 @@ def get_loss(
                     tsm_sigma_max,
                     tsm_force_contribution="absolute",
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -394,9 +417,9 @@ def get_loss(
                     tsm_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
+                    lambda_scheme=tsm_lambda_scheme,
                     reduce=reduce_op,
                 )
                 weighted_losses = losses * kappas * lambdas
@@ -419,8 +442,7 @@ def get_loss(
                     tsm_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -429,7 +451,7 @@ def get_loss(
 
             s_rng, posterior_rng = jax.random.split(error_rng)
             #TODO change hard coded t_min to a parameter
-            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6, delta_s=sc_delta_s)
+            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6, delta_s=delta_s)
             r_s = _vp_posterior_sample(posterior_rng, sde, batch, perturbed_data, s_vals, ts)
             teacher_score = teacher_score_fn(r_s, features, s_vals)
 
@@ -453,9 +475,9 @@ def get_loss(
                     sg_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
+                    lambda_scheme=sg_lambda_scheme,
                     reduce=reduce_op,
                 )
                 sc_per_sample, kappas_sg, lambdas_sg = semigroup_consistency_loss(
@@ -472,8 +494,8 @@ def get_loss(
                     sg_t0,
                     sg_sigma_max,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
+                    lambda_scheme=sg_lambda_scheme,
                     reduce=reduce_op,
                 )
                 is_anchor = std <= force_sigma_max
@@ -505,8 +527,7 @@ def get_loss(
                     sg_sigma_max,
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -524,8 +545,7 @@ def get_loss(
                     sg_t0,
                     sg_sigma_max,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     reduce=reduce_op,
                 )
                 is_anchor = std <= force_sigma_max
@@ -549,8 +569,8 @@ def get_loss(
                     sg_t0,
                     sg_sigma_max,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
+                    lambda_scheme=sg_lambda_scheme,
                     reduce=reduce_op,
                 )
                 # Match the TSM mode-mixture objective: DSM and semigroup
@@ -577,8 +597,7 @@ def get_loss(
                     sg_t0,
                     sg_sigma_max,
                     sigma_data=sigma_data,
-                    sigma_mode_sq=sigma_mode_sq,
-                    lambda_scheme=lambda_scheme,
+                    sigma_mode_sq=effective_sigma_mode_sq,
                     reduce=reduce_op,
                 )
                 sc_loss = reduce_op(sc_per_sample)
@@ -834,16 +853,11 @@ def _sample_s_before_t(
     t_min: float,
     delta_s: Optional[float] = None,
 ) -> jnp.ndarray:
-    """Sample s elementwise, strictly below each t.
-
-    With ``delta_s=None``, samples s ~ Uniform(t_min, t) (the full range below
-    t). With ``delta_s`` set, restricts the lower bound to ``t - delta_s``,
-    i.e. samples s ~ Uniform(max(t_min, t - delta_s), t), so s stays within a
-    window of size ``delta_s`` immediately below t.
+    """Sample s ~ Uniform(t_min, t) elementwise, strictly below each t.
 
     Requires t > t_min elementwise (guaranteed if t_min matches whatever
     lower bound was used to sample t itself upstream).
     """
+    lower = t_min if delta_s is None else jnp.maximum(t_min, t - delta_s)
     u = jax.random.uniform(rng, shape=t.shape, dtype=t.dtype)
-    lower = jnp.full_like(t, t_min) if delta_s is None else jnp.maximum(t_min, t - delta_s)
     return lower + u * (t - lower)

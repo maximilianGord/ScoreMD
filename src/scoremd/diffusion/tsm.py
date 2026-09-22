@@ -146,6 +146,7 @@ def tsm_loss(
     tsm_force_contribution: TSMForceContribution = "absolute",
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
+    lambda_scheme: LambdaScheme = "uniform",
     kbT: float = 1.0,
     reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
 ) -> tuple[ArrayLike, ArrayLike]:
@@ -216,7 +217,7 @@ def tsm_loss(
             sigma_data_sq = jnp.square(jnp.asarray(sigma_data, dtype=x.dtype))
 
         kappa_t = sigma_sq / jnp.maximum(sigma_sq + jnp.square(alpha_t) * sigma_data_sq, 1e-12)
-        lambda_t = _optimal_tsm_lambda(sigma_sq, sigma_data_sq)
+        lambda_t = _optimal_tsm_lambda(sigma_sq, sigma_data_sq, alpha_sq=jnp.square(alpha_t), scheme=lambda_scheme)
         weighted_loss = time_weights * lambda_t  * loss_per_sample
         return weighted_loss, kappa_t, lambda_t
 
@@ -240,6 +241,7 @@ def semigroup_consistency_loss(
     sg_sigma_max: float,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
+    lambda_scheme: LambdaScheme = "uniform",
     reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Compute the score-semigroup consistency loss L_SG.
@@ -297,7 +299,9 @@ def semigroup_consistency_loss(
         kappa_st = b_sq_t_given_s / jnp.maximum(
             b_sq_t_given_s + jnp.square(a_t_given_s) * sigma_data_sq, 1e-12
         )
-        lambda_st = _optimal_tsm_lambda(b_sq_t_given_s, sigma_data_sq)
+        lambda_st = _optimal_tsm_lambda(
+            b_sq_t_given_s, sigma_data_sq, alpha_sq=jnp.square(a_t_given_s), scheme=lambda_scheme
+        )
         weighted_loss = jnp.where(valid, time_weights * lambda_st * loss_per_sample, jnp.nan)
         return weighted_loss, kappa_st, lambda_st
 

@@ -490,7 +490,8 @@ if __name__ == "__main__":
         ],
     )
 
-    run_dir_path = "outputs/${dataset.name}/${now:%Y-%m-%d/%H-%M-%S}"
+    output_root = os.environ.get("OUTPUT_ROOT", "outputs")
+    run_dir_path = output_root + "/${dataset.name}/${now:%Y-%m-%d/%H-%M-%S}"
 
     slurm_job_id = slurm.get_slurm_job_id()
     if slurm_job_id is not None:

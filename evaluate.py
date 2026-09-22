@@ -50,6 +50,7 @@ class EvaluationSettings:
     aldp_evaluate_forces: bool = True  # Whether to evaluate the forces of the model
     limit_inference_peptides: Optional[Sequence[str]] = None  # If specified, only evaluate on these peptides
     only_store_results: bool = False  # If this is true, we only store the results with minimal evaluation.
+    mueller_brown_partial_denoise_t0s: Optional[Sequence[float]] = None  # Additional reverse-SDE stopping times t0 (besides the usual t0=0.0) at which to draw and compare Mueller-Brown samples, e.g. (0.01,)
 
 
 def evaluate(
@@ -138,6 +139,17 @@ def evaluate(
                 dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, ground_truth_marginals,
                 seed=evaluation.seed,
             )
+            if evaluation.mueller_brown_partial_denoise_t0s:
+                metrics |= evaluate_mueller_brown_partial_denoising(
+                    dataset.train,
+                    dataset,
+                    trained_unnormalized_score,
+                    norm_factor,
+                    out_dir,
+                    ground_truth_marginals,
+                    t0s=(0.0, *evaluation.mueller_brown_partial_denoise_t0s),
+                    seed=evaluation.seed,
+                )
             metrics |= simulate_mueller_brown(
                 dataset.train, dataset, force, out_dir, ground_truth_marginals, seed=evaluation.seed
             )
@@ -1012,6 +1024,53 @@ def evaluate_mueller_brown_samples(
         "eval/iid_rms_fe_sq_error": rms_fe_sq_error,
         "eval/iid_rms_mjs_error": rms_mjs_error,
     }
+
+
+def evaluate_mueller_brown_partial_denoising(
+    datapoints: Datapoints,
+    dataset: MuellerBrownSimulation,
+    score: Callable,
+    norm_factor: jnp.ndarray,
+    out_dir: str,
+    ground_truth_marginals: tuple[onp.ndarray, onp.ndarray, onp.ndarray, onp.ndarray],
+    t0s: Sequence[float],
+    seed: int,
+) -> dict:
+    """Compare samples obtained by stopping the reverse SDE at several different times t0.
+
+    Denoising all the way to t0=0.0 is the usual sampling procedure. Stopping earlier (e.g.
+    t0=0.01) leaves some of the forward-noising still un-undone, which is useful for diagnosing
+    whether a model that scores well at t0=0.0 is doing so because it has actually learned the
+    data distribution, or because the last bit of denoising is masking upstream score errors.
+    """
+    metrics = {}
+
+    plt.figure(figsize=(6 * len(t0s), 5), clear=True)
+    for panel, t0 in enumerate(t0s, start=1):
+        q_samples = get_samples(datapoints.data.shape, None, score, norm_factor=norm_factor, seed=seed, t0=t0)
+        outliers = (jnp.abs(q_samples) > 20).sum(axis=1) > 0
+        if outliers.sum() > 0:
+            log.warning(f"[t0={t0:g}] There are {outliers.mean() * 100:.3f}% outliers. Filtering them out...")
+        q_samples = q_samples[~outliers]
+
+        plt.subplot(1, len(t0s), panel)
+        plt.title(f"denoised t: 1 → {t0:g}")
+        dataset.plot(q_samples)
+
+        metrics[f"eval/partial_denoise_js_divergence_t0={t0:g}"] = js_divergence(datapoints.data, q_samples, bins=100)
+
+        plot_mueller_brown_marginals(
+            q_samples,
+            ground_truth_marginals,
+            f"t0={t0:g} samples",
+            f"{out_dir}/mueller-brown-partial-denoise-t0={t0:g}-marginals.png",
+        )
+
+    plt.tight_layout()
+    plt.savefig(f"{out_dir}/mueller-brown-partial-denoise-comparison.png", bbox_inches="tight")
+    plt.close()
+
+    return metrics
 
 
 def simulate_mueller_brown(

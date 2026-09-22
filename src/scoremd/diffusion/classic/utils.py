@@ -90,8 +90,10 @@ def get_loss(
     t_0_lambda: float = 1.0,
     sc_switch: bool = False,
     force_sigma_max: float = 0.01,
+    sc_delta_s: Optional[float] = None,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
+    lambda_scheme: str = "uniform",
     kbT: float = 1.0,
     **kwargs,
 ):
@@ -303,6 +305,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -328,6 +331,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -364,6 +368,7 @@ def get_loss(
                     tsm_force_contribution="absolute",
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -390,6 +395,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -414,6 +420,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -422,7 +429,7 @@ def get_loss(
 
             s_rng, posterior_rng = jax.random.split(error_rng)
             #TODO change hard coded t_min to a parameter
-            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6)
+            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6, delta_s=sc_delta_s)
             r_s = _vp_posterior_sample(posterior_rng, sde, batch, perturbed_data, s_vals, ts)
             teacher_score = teacher_score_fn(r_s, features, s_vals)
 
@@ -447,6 +454,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -465,6 +473,7 @@ def get_loss(
                     sg_sigma_max,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     reduce=reduce_op,
                 )
                 is_anchor = std <= force_sigma_max
@@ -497,6 +506,7 @@ def get_loss(
                     tsm_force_contribution=tsm_force_contribution,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     kbT=kbT,
                     reduce=reduce_op,
                 )
@@ -515,6 +525,7 @@ def get_loss(
                     sg_sigma_max,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     reduce=reduce_op,
                 )
                 is_anchor = std <= force_sigma_max
@@ -539,6 +550,7 @@ def get_loss(
                     sg_sigma_max,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     reduce=reduce_op,
                 )
                 # Match the TSM mode-mixture objective: DSM and semigroup
@@ -566,6 +578,7 @@ def get_loss(
                     sg_sigma_max,
                     sigma_data=sigma_data,
                     sigma_mode_sq=sigma_mode_sq,
+                    lambda_scheme=lambda_scheme,
                     reduce=reduce_op,
                 )
                 sc_loss = reduce_op(sc_per_sample)
@@ -819,11 +832,18 @@ def _sample_s_before_t(
     rng: jax.random.PRNGKey,
     t: jnp.ndarray,
     t_min: float,
+    delta_s: Optional[float] = None,
 ) -> jnp.ndarray:
-    """Sample s ~ Uniform(t_min, t) elementwise, strictly below each t.
+    """Sample s elementwise, strictly below each t.
+
+    With ``delta_s=None``, samples s ~ Uniform(t_min, t) (the full range below
+    t). With ``delta_s`` set, restricts the lower bound to ``t - delta_s``,
+    i.e. samples s ~ Uniform(max(t_min, t - delta_s), t), so s stays within a
+    window of size ``delta_s`` immediately below t.
 
     Requires t > t_min elementwise (guaranteed if t_min matches whatever
     lower bound was used to sample t itself upstream).
     """
     u = jax.random.uniform(rng, shape=t.shape, dtype=t.dtype)
-    return t_min + u * (t - t_min)
+    lower = jnp.full_like(t, t_min) if delta_s is None else jnp.maximum(t_min, t - delta_s)
+    return lower + u * (t - lower)

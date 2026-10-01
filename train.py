@@ -52,6 +52,11 @@ def _set_runtime_loss_options(ranged_loss, **options) -> None:
     ranged_loss.loss = functools.partial(loss_factory.func, *loss_factory.args, **keywords)
 
 
+def _force_positions(datapoints: Datapoints) -> jnp.ndarray:
+    """Positions at which the force targets are evaluated (biased samples under enhanced sampling)."""
+    return datapoints.data if datapoints.force_data is None else datapoints.force_data
+
+
 def _forces_cache_path(dataset: Dataset, datapoints: Datapoints) -> Optional[str]:
     """Deterministic on-disk cache location for a (dataset, datapoints) pair's physical forces.
 
@@ -62,7 +67,7 @@ def _forces_cache_path(dataset: Dataset, datapoints: Datapoints) -> Optional[str
     try:
         sha256 = hashlib.sha256()
         sha256.update(repr(dataset).encode("utf-8"))
-        sha256.update(np.asarray(datapoints.data).tobytes())
+        sha256.update(np.asarray(_force_positions(datapoints)).tobytes())
         digest = sha256.hexdigest()
     except Exception as e:
         log.warning("Could not compute a forces cache key; forces will not be cached: %s", e)
@@ -100,7 +105,7 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
         except Exception as e:
             log.warning("Failed to load cached forces from %s: %s", cache_path, e)
 
-    target_frames = np.asarray(datapoints.data).reshape((-1, *sample_shape))
+    target_frames = np.asarray(_force_positions(datapoints)).reshape((-1, *sample_shape))
     force_coordinates = (
         dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
     )
@@ -376,7 +381,17 @@ def training_routine(
             if train_data.forces is None
             else jnp.concatenate([train_data.forces] * BS, axis=0, dtype=train_data.forces.dtype)[:BS]
         )
-        train_data = train_data.replace(data=new_train_data, features=new_train_features, forces=new_train_forces)
+        new_train_force_data = (
+            None
+            if train_data.force_data is None
+            else jnp.concatenate([train_data.force_data] * BS, axis=0)[:BS]
+        )
+        train_data = train_data.replace(
+            data=new_train_data,
+            features=new_train_features,
+            forces=new_train_forces,
+            force_data=new_train_force_data,
+        )
     if training_schedule.BS % num_devices != 0:
         raise ValueError(f"Batch size ({training_schedule.BS}) must be divisible by number of devices ({num_devices})")
 

@@ -93,6 +93,12 @@ def get_loss(
     sc_switch: bool = False,
     force_sigma_max: float = 0.01,
     sc_delta_s: Optional[float] = None,
+    sc_s_sampling: str = "uniform",
+    sc_s_bias: float = 0.5,
+    sc_bias_sigma_max: Optional[float] = None,
+    sc_frontier_warmup: float = 0.5,
+    sc_frontier_power: float = 1.0,
+    sc_frontier_tsm_share: float = 0.3,
     sigma_data: float = 1.0,
     sigma_mode_sq: Optional[float] = None,
     lambda_scheme: str = "uniform",
@@ -113,9 +119,19 @@ def get_loss(
       beta: A float, the weight of the scalar field FP loss.
       gamma: A float, the weight of the diffusion loss.
       fp_dist: A string, the distribution to use for the FP loss. Can be 'pert' for perturbed data or 'x' for original data.
-      delta_s: For loss_type='sc', restricts the sampled semigroup time s to
-        [max(t_min, t - delta_s), t) instead of [t_min, t). None (default)
-        keeps the unrestricted [t_min, t) range.
+      sc_delta_s: For loss_type='sc', restricts the uniformly sampled semigroup time s to
+        [max(t_min, t - sc_delta_s), t) instead of [t_min, t). None (default)
+        keeps the unrestricted [t_min, t) range. ``delta_s`` is an alias kept for old configs.
+      sc_s_sampling: For loss_type='sc', how the semigroup time s is sampled: 'uniform'
+        (s ~ U(lower, t)), 'bias_tsm' (a fraction ``sc_s_bias`` of s is drawn from the TSM regime
+        sigma(s) <= sc_bias_sigma_max) or 'bias_frontier' (like 'bias_tsm', but the biased region
+        grows with training progress up to t = 1). See sc_s_sampling.md.
+      sc_s_bias: Fraction of s drawn from the biased region (0 = uniform, 1 = only biased).
+      sc_bias_sigma_max: Noise level sigma that bounds the TSM regime. None falls back to
+        ``force_sigma_max`` if ``sc_switch`` else ``tsm_sigma_max``.
+      sc_frontier_warmup: Fraction of training after which the frontier reaches t = 1.
+      sc_frontier_power: Shape of the frontier's motion, progress ** power (>1 lingers near the TSM regime).
+      sc_frontier_tsm_share: For 'bias_frontier', the fraction of biased draws kept in the TSM regime.
 
     The returned loss function also accepts a keyword-only
     ``sigma_mode_sq_per_sample`` argument (a per-batch-sample array, sliced
@@ -142,12 +158,39 @@ def get_loss(
         raise ValueError(f"Unknown tsm_lambda_scheme={tsm_lambda_scheme!r}.")
     if sg_type == "mode_mixture" and sg_lambda_scheme not in valid_lambda_schemes:
         raise ValueError(f"Unknown sg_lambda_scheme={sg_lambda_scheme!r}.")
+    if loss_type == "sc":
+        if sc_s_sampling not in ("uniform", "bias_tsm", "bias_frontier"):
+            raise ValueError(f"Unknown sc_s_sampling={sc_s_sampling!r}. Use 'uniform', 'bias_tsm' or 'bias_frontier'.")
+        if not 0.0 <= sc_s_bias <= 1.0:
+            raise ValueError(f"sc_s_bias must be in [0, 1]; got {sc_s_bias}.")
+        if not 0.0 <= sc_frontier_tsm_share <= 1.0:
+            raise ValueError(f"sc_frontier_tsm_share must be in [0, 1]; got {sc_frontier_tsm_share}.")
+        if sc_frontier_warmup <= 0.0:
+            raise ValueError(f"sc_frontier_warmup must be > 0; got {sc_frontier_warmup}.")
+        if sc_frontier_power <= 0.0:
+            raise ValueError(f"sc_frontier_power must be > 0; got {sc_frontier_power}.")
+    if sc_delta_s is not None and delta_s is not None and sc_delta_s != delta_s:
+        raise ValueError(f"sc_delta_s={sc_delta_s} and its alias delta_s={delta_s} disagree; set only one.")
+    delta_s = sc_delta_s if sc_delta_s is not None else delta_s
     log.info("Using VP-SDE")
     from scoremd.diffusion.classic.sde import VP
     from scoremd.diffusion.tsm import semigroup_consistency_loss, tsm_loss
 
     sde = VP()
     from scoremd.diffusion.fp import fp_vp_loss
+
+    sc_t_min = 1e-6
+    if loss_type == "sc" and sc_s_sampling != "uniform":
+        if sc_bias_sigma_max is None:
+            sc_bias_sigma_max = force_sigma_max if sc_switch else tsm_sigma_max
+        t_of_sigma, t_of_log_snr = _vp_time_inverses(sde, t_min=sc_t_min)
+        sc_t_tsm = t_of_sigma(sc_bias_sigma_max)
+        sc_log_snr_tsm = _vp_log_snr(sde, sc_t_tsm)
+        sc_log_snr_end = _vp_log_snr(sde, jnp.asarray(1.0))
+        log.info(
+            f"SC s-sampling: {sc_s_sampling}, bias={sc_s_bias}, TSM regime sigma <= {sc_bias_sigma_max} "
+            f"(t <= {float(sc_t_tsm):.4f})"
+        )
 
     reduce_op = jnp.mean if reduce_mean else lambda *args, **kwargs: 0.5 * jnp.sum(*args, **kwargs)
     time_weighting_sg = lambda _s, t: time_weighting(t)
@@ -164,6 +207,8 @@ def get_loss(
         training: bool,
         *,
         sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
+        force_batch: Optional[ArrayLike] = None,
+        progress: Optional[ArrayLike] = None,
     ) -> Sequence[ArrayLike]:
         # Per-sample sigma_mode_sq (e.g. mode_var_computation="gmm_per_sample") overrides
         # the scalar `sigma_mode_sq` config value when supplied by the caller; otherwise
@@ -310,6 +355,17 @@ def get_loss(
 
             losses *= time_weighting(ts)
             diffusion_loss = jnp.mean(losses)  # scalar
+
+        # Positions for the force-based terms (TSM, SC force anchor). By default the forces belong to
+        # ``batch``; with ``force_batch`` (enhanced sampling) they belong to separately sampled (biased)
+        # positions, perturbed at the same times ``ts``, while DSM and the semigroup term keep ``batch``.
+        force_positions, force_perturbed_data, force_score = batch, perturbed_data, score
+        if force_batch is not None and loss_type in ("tsm", "sc"):
+            rng, force_rng = jax.random.split(rng)
+            force_positions = force_batch
+            force_perturbed_data, _, _ = perturb(ts, sde, force_rng, force_batch)
+            force_score = score_fn(force_perturbed_data, features, ts)
+
         if loss_type == "tsm":
             if forces is None:
                 raise ValueError("loss_type='tsm' requires precomputed per-sample forces.")
@@ -317,8 +373,8 @@ def get_loss(
                 target_score_losses, kappas, lambdas = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -343,8 +399,8 @@ def get_loss(
                 target_score_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -375,12 +431,12 @@ def get_loss(
             if not sc_switch:
                 # TODO : Change the hardcoded t_0 = 0
                 t0 = jnp.zeros_like(ts)
-                score_at_0 = score_fn(batch, features, t0)
+                score_at_0 = score_fn(force_positions, features, t0)
                 force_anchor_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
                     score_at_0,
-                    batch,
+                    force_positions,
                     forces,
                     features,
                     t0,
@@ -405,8 +461,8 @@ def get_loss(
                 target_score_losses, kappas, lambdas = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -430,8 +486,8 @@ def get_loss(
                 target_score_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -451,7 +507,26 @@ def get_loss(
 
             s_rng, posterior_rng = jax.random.split(error_rng)
             #TODO change hard coded t_min to a parameter
-            s_vals = _sample_s_before_t(s_rng, ts, t_min=1e-6, delta_s=delta_s)
+            if sc_s_sampling == "uniform":
+                s_vals = _sample_s_before_t(s_rng, ts, t_min=sc_t_min, delta_s=delta_s)
+            else:
+                if sc_s_sampling == "bias_tsm":
+                    t_bias, tsm_share = sc_t_tsm, 0.0
+                else:
+                    if progress is None:
+                        raise ValueError("sc_s_sampling='bias_frontier' requires the training progress.")
+                    t_bias = _frontier_t(
+                        progress,
+                        sc_frontier_warmup,
+                        sc_frontier_power,
+                        sc_log_snr_tsm,
+                        sc_log_snr_end,
+                        t_of_log_snr,
+                    )
+                    tsm_share = sc_frontier_tsm_share
+                s_vals = _sample_s_biased(
+                    s_rng, ts, sc_t_min, delta_s, sc_s_bias, t_bias, sc_t_tsm, tsm_share
+                )
             r_s = _vp_posterior_sample(posterior_rng, sde, batch, perturbed_data, s_vals, ts)
             teacher_score = teacher_score_fn(r_s, features, s_vals)
 
@@ -463,8 +538,8 @@ def get_loss(
                 anchor_losses, kappas_anchor, lambdas_anchor = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -515,8 +590,8 @@ def get_loss(
                 anchor_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
-                    score,
-                    perturbed_data,
+                    force_score,
+                    force_perturbed_data,
                     forces,
                     features,
                     ts,
@@ -853,7 +928,11 @@ def _sample_s_before_t(
     t_min: float,
     delta_s: Optional[float] = None,
 ) -> jnp.ndarray:
-    """Sample s ~ Uniform(t_min, t) elementwise, strictly below each t.
+    """Sample s ~ Uniform(lower, t) elementwise, strictly below each t.
+
+    ``lower`` is ``t_min`` by default. If ``delta_s`` is given, ``lower`` is
+    instead ``max(t_min, t - delta_s)``, restricting s to [t - delta_s, t)
+    so the semigroup gap t - s is capped at ``delta_s``.
 
     Requires t > t_min elementwise (guaranteed if t_min matches whatever
     lower bound was used to sample t itself upstream).
@@ -861,3 +940,72 @@ def _sample_s_before_t(
     lower = t_min if delta_s is None else jnp.maximum(t_min, t - delta_s)
     u = jax.random.uniform(rng, shape=t.shape, dtype=t.dtype)
     return lower + u * (t - lower)
+
+
+def _vp_log_snr(sde, t: jnp.ndarray) -> jnp.ndarray:
+    """log(alpha_t^2 / sigma_t^2) of the VP SDE, decreasing in t."""
+    log_mean_coeff = sde.log_mean_coeff(t)
+    return 2.0 * log_mean_coeff - jnp.log(-jnp.expm1(2.0 * log_mean_coeff))
+
+
+def _vp_time_inverses(sde, t_min: float, t_max: float = 1.0, num_points: int = 4096):
+    """Lookup-table inverses t(sigma) and t(log_snr) of the VP SDE on [t_min, t_max].
+
+    Built only from ``sde.log_mean_coeff``, so it holds for any monotone noise schedule.
+    The grid is quadratic in t to resolve the small-noise region.
+    """
+    t_grid = t_min + (t_max - t_min) * jnp.square(jnp.linspace(0.0, 1.0, num_points))
+    sigma_grid = jnp.sqrt(-jnp.expm1(2.0 * sde.log_mean_coeff(t_grid)))
+    neg_log_snr_grid = -_vp_log_snr(sde, t_grid)  # increasing in t, as jnp.interp requires
+
+    def t_of_sigma(sigma):
+        return jnp.interp(sigma, sigma_grid, t_grid)
+
+    def t_of_log_snr(log_snr):
+        return jnp.interp(-log_snr, neg_log_snr_grid, t_grid)
+
+    return t_of_sigma, t_of_log_snr
+
+
+def _frontier_t(
+    progress: ArrayLike,
+    warmup: float,
+    power: float,
+    log_snr_start: ArrayLike,
+    log_snr_end: ArrayLike,
+    t_of_log_snr: Callable[[ArrayLike], ArrayLike],
+) -> jnp.ndarray:
+    """Frontier time t_f: moves linearly in log-SNR from the TSM edge to t = 1 over the warmup.
+
+    ``progress`` is the fraction of training done (0 at the first batch, 1 at the end).
+    """
+    p = jnp.clip(jnp.asarray(progress) / warmup, 0.0, 1.0) ** power
+    return t_of_log_snr(log_snr_start + p * (log_snr_end - log_snr_start))
+
+
+def _sample_s_biased(
+    rng: jax.random.PRNGKey,
+    t: jnp.ndarray,
+    t_min: float,
+    delta_s: Optional[float],
+    bias: float,
+    t_bias: ArrayLike,
+    t_tsm: ArrayLike,
+    tsm_share: float,
+) -> jnp.ndarray:
+    """Sample s < t from the mixture (1 - bias) * U(lower, t) + bias * U(t_min, min(t, edge)).
+
+    The uniform part is :func:`_sample_s_before_t` (respecting ``delta_s``). The biased part
+    ignores ``delta_s``; its upper edge is ``t_bias``, except for a fraction ``tsm_share`` of the
+    biased draws whose edge stays at the TSM boundary ``t_tsm``.
+    """
+    uniform_rng, choice_rng, share_rng, biased_rng = jax.random.split(rng, 4)
+    s_uniform = _sample_s_before_t(uniform_rng, t, t_min=t_min, delta_s=delta_s)
+
+    edge = jnp.where(jax.random.uniform(share_rng, shape=t.shape) < tsm_share, t_tsm, t_bias)
+    upper = jnp.minimum(t, edge)
+    u = jax.random.uniform(biased_rng, shape=t.shape, dtype=t.dtype)
+    s_biased = t_min + u * (upper - t_min)
+
+    use_bias = jax.random.uniform(choice_rng, shape=t.shape) < bias
+    return jnp.where(use_bias, s_biased, s_uniform)

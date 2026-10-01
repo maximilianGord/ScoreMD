@@ -12,6 +12,10 @@ class Datapoints(struct.PyTreeNode):
     data: jnp.ndarray
     features: Optional[jnp.ndarray]
     forces: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
+    # Positions paired with ``forces`` for the force-based terms (TSM, SC anchor). ``None`` means the
+    # forces belong to ``data``. Enhanced sampling uses this so DSM trains on unbiased ``data`` while
+    # the force targets are evaluated on biased samples.
+    force_data: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
     sigma_mode_sq: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
 
     def __post_init__(self):
@@ -29,6 +33,11 @@ class Datapoints(struct.PyTreeNode):
                 raise ValueError(
                     f"forces must have the same shape as data; got {self.forces.shape} and {self.data.shape}."
                 )
+        if self.force_data is not None:
+            if self.force_data.shape != self.data.shape:
+                raise ValueError(
+                    f"force_data must have the same shape as data; got {self.force_data.shape} and {self.data.shape}."
+                )
         if self.sigma_mode_sq is not None:
             if self.sigma_mode_sq.shape != (self.data.shape[0],):
                 raise ValueError(
@@ -44,6 +53,7 @@ class Datapoints(struct.PyTreeNode):
             self.data[idx],
             self.features[idx] if self.features is not None else None,
             forces=self.forces[idx] if self.forces is not None else None,
+            force_data=self.force_data[idx] if self.force_data is not None else None,
             sigma_mode_sq=self.sigma_mode_sq[idx] if self.sigma_mode_sq is not None else None,
         )
 

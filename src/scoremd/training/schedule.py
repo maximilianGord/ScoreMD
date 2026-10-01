@@ -106,6 +106,8 @@ class TrainingSchedule(abc.ABC):
         validation: bool,
         key: ArrayLike,
         sigma_mode_sq: Optional[ArrayLike] = None,
+        force_batch: Optional[ArrayLike] = None,
+        progress: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         """Use this train step when you have no clue about the ordering of t and it could be that each loss function needs to be called on it."""
 
@@ -120,6 +122,8 @@ class TrainingSchedule(abc.ABC):
             is_special_epoch: bool,
             *,
             sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
+            force_batch: Optional[ArrayLike] = None,
+            progress: Optional[ArrayLike] = None,
         ) -> Tuple[ArrayLike, ArrayLike]:
             # `_train_step_single_loss` always calls its `loss_fn` with a
             # `sigma_mode_sq_per_sample` kwarg; accepted here for call
@@ -142,6 +146,8 @@ class TrainingSchedule(abc.ABC):
                         ts,
                         is_special_epoch,
                         sigma_mode_sq_per_sample=sigma_mode_sq,
+                        force_batch=force_batch,
+                        progress=progress,
                     ),
                     lambda: (jnp.sum(jnp.zeros(5)), jnp.zeros(5)),
                 )
@@ -151,7 +157,18 @@ class TrainingSchedule(abc.ABC):
             return sum_loss, sum_aux
 
         return TrainingSchedule._train_step_single_loss(
-            merged_loss, state, batch, features, forces, ts, is_special_epoch, validation, key, sigma_mode_sq
+            merged_loss,
+            state,
+            batch,
+            features,
+            forces,
+            ts,
+            is_special_epoch,
+            validation,
+            key,
+            sigma_mode_sq,
+            force_batch=force_batch,
+            progress=progress,
         )
 
     @staticmethod
@@ -166,6 +183,8 @@ class TrainingSchedule(abc.ABC):
         validation: bool,
         key: ArrayLike,
         sigma_mode_sq: Optional[ArrayLike] = None,
+        force_batch: Optional[ArrayLike] = None,
+        progress: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
             _, loss = loss_fn(
@@ -179,6 +198,8 @@ class TrainingSchedule(abc.ABC):
                 is_special_epoch,
                 False,
                 sigma_mode_sq_per_sample=sigma_mode_sq,
+                force_batch=force_batch,
+                progress=progress,
             )
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
@@ -192,6 +213,8 @@ class TrainingSchedule(abc.ABC):
             is_special_epoch,
             True,
             sigma_mode_sq_per_sample=sigma_mode_sq,
+            force_batch=force_batch,
+            progress=progress,
         )
 
         state = state.apply_gradients(grads=grads)
@@ -210,8 +233,14 @@ class TrainingSchedule(abc.ABC):
         key: jnp.ndarray,
         data_sharding: Optional[jax.sharding.Sharding],
         replicated_sharding: Optional[jax.sharding.Sharding],
+        epoch: ArrayLike = 0,
+        num_epochs: int = 1,
     ) -> Tuple[EmaTrainState, jnp.ndarray]:
-        """Trains the model for one epoch."""
+        """Trains the model for one epoch.
+
+        ``epoch`` (traced) and ``num_epochs`` define the training progress handed to the loss
+        functions, ``(epoch + batch_idx / steps_per_epoch) / num_epochs``, updated every batch.
+        """
         key, shuffle_key = jax.random.split(key)
         perms = TrainingSchedule._shuffle(datapoints, self.BS, shuffle_key)
 
@@ -220,13 +249,18 @@ class TrainingSchedule(abc.ABC):
         if replicated_sharding is not None:
             state = jax.lax.with_sharding_constraint(state, replicated_sharding)
 
-        def train_step_scan(carry, perm):
+        steps_per_epoch = len(perms)
+
+        def train_step_scan(carry, scan_input):
+            perm, batch_idx = scan_input
+            progress = (epoch + batch_idx / steps_per_epoch) / num_epochs
             key, state = carry
             key, iter_key, augment_key = jax.random.split(key, 3)
 
             current_data = datapoints.data[perm, ...]
             current_features = datapoints.features[perm, ...] if datapoints.features is not None else None
             current_forces = datapoints.forces[perm, ...] if datapoints.forces is not None else None
+            current_force_data = datapoints.force_data[perm, ...] if datapoints.force_data is not None else None
             current_sigma_mode_sq = (
                 datapoints.sigma_mode_sq[perm, ...] if datapoints.sigma_mode_sq is not None else None
             )
@@ -236,6 +270,8 @@ class TrainingSchedule(abc.ABC):
                     current_features = jax.lax.with_sharding_constraint(current_features, data_sharding)
                 if current_forces is not None:
                     current_forces = jax.lax.with_sharding_constraint(current_forces, data_sharding)
+                if current_force_data is not None:
+                    current_force_data = jax.lax.with_sharding_constraint(current_force_data, data_sharding)
                 if current_sigma_mode_sq is not None:
                     current_sigma_mode_sq = jax.lax.with_sharding_constraint(current_sigma_mode_sq, data_sharding)
 
@@ -246,6 +282,10 @@ class TrainingSchedule(abc.ABC):
                     current_forces = apply_random_rotations_to_vectors(current_forces, augment_key)
                 else:
                     current_forces = self.augment(current_forces, current_features, augment_key)
+            if current_force_data is not None:
+                # Same augment key as the forces, so positions and forces stay consistent.
+                current_force_data = self.augment(current_force_data, current_features, augment_key)
+                current_force_data *= norm_factor
             current_data *= norm_factor
             if current_forces is not None:
                 current_forces /= norm_factor
@@ -267,6 +307,8 @@ class TrainingSchedule(abc.ABC):
                         validation,
                         step_key,
                         current_sigma_mode_sq,
+                        force_batch=current_force_data,
+                        progress=progress,
                     )
                 else:
                     state, cur_loss = self._mixed_t_train_step(
@@ -280,6 +322,8 @@ class TrainingSchedule(abc.ABC):
                         validation,
                         step_key,
                         current_sigma_mode_sq,
+                        force_batch=current_force_data,
+                        progress=progress,
                     )
                 cur_losses.append(cur_loss)
 
@@ -289,7 +333,9 @@ class TrainingSchedule(abc.ABC):
             log.info(f"Validating {len(perms)} batches in each validation epoch.")
         else:
             log.info(f"Training {len(perms)} batches in each epoch.")
-        (_, state), losses = jax.lax.scan(train_step_scan, (key, state), perms)
+        (_, state), losses = jax.lax.scan(
+            train_step_scan, (key, state), (perms, jnp.arange(steps_per_epoch, dtype=jnp.float32))
+        )
         losses = jnp.array(losses)
 
         # Keep the optimized student parameters separate from the EMA teacher.
@@ -298,7 +344,7 @@ class TrainingSchedule(abc.ABC):
     def _train_n_epochs(
         self,
         train_single_epoch: Callable[
-            [EmaTrainState, Datapoints, bool, bool, jnp.ndarray], Tuple[EmaTrainState, jnp.ndarray]
+            [EmaTrainState, Datapoints, bool, bool, jnp.ndarray, jnp.ndarray], Tuple[EmaTrainState, jnp.ndarray]
         ],
         data: Datapoints,
         val_data: Optional[Datapoints],
@@ -342,7 +388,8 @@ class TrainingSchedule(abc.ABC):
                     )
                     special_epoch = False
 
-            new_state, loss = train_single_epoch(state, data, False, special_epoch, iter_key)
+            epoch_arr = jnp.asarray(epoch, dtype=jnp.float32)
+            new_state, loss = train_single_epoch(state, data, False, special_epoch, iter_key, epoch_arr)
 
             # ensure that we don't get stuck in a nan loop
             if jnp.isnan(loss).any():
@@ -363,7 +410,7 @@ class TrainingSchedule(abc.ABC):
                 state = new_state  # only update the parameters if there was no nan
                 val_loss = None
                 if val_data is not None and epoch % self.validation_every == 0:
-                    _, val_loss = train_single_epoch(state, val_data, True, special_epoch, iter_key)
+                    _, val_loss = train_single_epoch(state, val_data, True, special_epoch, iter_key, epoch_arr)
                 yield state, loss, val_loss
 
     @staticmethod
@@ -495,7 +542,12 @@ class AllAtOnce(TrainingSchedule):
 
         @partial(jax.jit, static_argnums=(2, 3))
         def step(
-            state: EmaTrainState, data: Datapoints, validation: bool, is_special_epoch: bool, key: jax.random.PRNGKey
+            state: EmaTrainState,
+            data: Datapoints,
+            validation: bool,
+            is_special_epoch: bool,
+            key: jax.random.PRNGKey,
+            epoch: jnp.ndarray,
         ):
             return self._train_epoch(
                 self._sample_ts,
@@ -509,6 +561,8 @@ class AllAtOnce(TrainingSchedule):
                 key,
                 data_sharding,
                 replicated_sharding,
+                epoch=epoch,
+                num_epochs=self.epochs,
             )
 
         tx = wrapped_optimizer(self.epochs * train_data.data.shape[0] // (self.BS * self.BS_factor))
@@ -660,6 +714,7 @@ class OneAfterAnother(TrainingSchedule):
                 validation: bool,
                 is_special_epoch: bool,
                 key: jax.random.PRNGKey,
+                epoch: jnp.ndarray,
             ):
                 def sample_ts(key):
                     yield jax.random.uniform(key, (self.BS,), minval=t0, maxval=t1), 0
@@ -679,6 +734,8 @@ class OneAfterAnother(TrainingSchedule):
                     key,
                     data_sharding,
                     replicated_sharding,
+                    epoch=epoch,
+                    num_epochs=num_epochs,
                 )
 
             partition_optimizers = {"trainable": original_optimizer, "frozen": optax.set_to_zero()}

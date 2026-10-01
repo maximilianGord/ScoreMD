@@ -1,5 +1,5 @@
 import os.path
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal, Optional, Tuple
 from deeptime.util import energy2d
 import jax.numpy as jnp
@@ -56,6 +56,46 @@ def mueller_brown_potential(xs: jnp.ndarray, beta: float = 1.0) -> jnp.ndarray:
     return beta * (e1 + e2 + e3 + e4)
 
 
+@dataclass(frozen=True)
+class GaussianUmbrellaBias:
+    """Umbrella bias ``V(r) = amplitude * exp(-(r[coordinate] - center)^2 / (2 * width^2))``."""
+
+    amplitude: float
+    center: float
+    width: float
+    coordinate: int = 0
+
+    def __call__(self, xs: jnp.ndarray) -> jnp.ndarray:
+        q = jnp.asarray(xs).reshape(-1, 2)[:, self.coordinate]
+        return self.amplitude * jnp.exp(-((q - self.center) ** 2) / (2 * self.width**2))
+
+
+# Rescaled Müller--Brown convention (x' = 16x + 32, y' = 16y + 8, u' = u / MB_RESCALED_ENERGY_FACTOR),
+# e.g. u1' = -17.3 exp(-0.0039 (x' - 48)^2 - 0.0391 (y' - 8)^2) corresponds to e1 above.
+MB_RESCALED_COORDINATE_SCALE = 16.0
+MB_RESCALED_X_OFFSET = 32.0
+MB_RESCALED_ENERGY_FACTOR = 200.0 / 17.3
+
+
+def gaussian_umbrella_bias_from_rescaled(amplitude: float, center: float, width: float) -> GaussianUmbrellaBias:
+    """Convert an x'-umbrella ``amplitude * exp(-(x' - center)^2 / (2 width^2))`` to this module's units."""
+    return GaussianUmbrellaBias(
+        amplitude=amplitude * MB_RESCALED_ENERGY_FACTOR,
+        center=(center - MB_RESCALED_X_OFFSET) / MB_RESCALED_COORDINATE_SCALE,
+        width=width / MB_RESCALED_COORDINATE_SCALE,
+        coordinate=0,
+    )
+
+
+# Bias potentials available for enhanced sampling via ``MuellerBrownSimulation(enhanced=<name>)``.
+MUELLER_BROWN_BIASES = {
+    # V(x') = -4 exp(-(x' - 32)^2 / (2 * 5^2)) in rescaled units -> center 0, width 0.3125, amplitude ~ -46.2
+    "bias_1": gaussian_umbrella_bias_from_rescaled(amplitude=-4.0, center=32.0, width=5.0),
+    # Same umbrella, but 4 kT deep at kbT = 23 (as bias_1 is at the rescaled system's kT = 1, i.e. kbT ~ 11.56 here).
+    "bias_1_kt23": replace(gaussian_umbrella_bias_from_rescaled(amplitude=-4.0, center=32.0, width=5.0), amplitude=-4.0 * 23.0),
+}
+
+
 @dataclass
 class MuellerBrownSimulation(Dataset):
     n_samples: int = 10_000
@@ -80,6 +120,7 @@ class MuellerBrownSimulation(Dataset):
         seed: int = 0,
         mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian",
         coarse_graining_level: MuellerBrownCoarseGrainingLevel | str = MuellerBrownCoarseGrainingLevel.NONE,
+        enhanced: Optional[str] = None,
         name="mueller_brown",
     ):
         if mode_var_computation not in {"potential", "data_hessian", "data_empirical"}:
@@ -87,6 +128,15 @@ class MuellerBrownSimulation(Dataset):
                 "mode_var_computation must be 'potential', 'data_hessian', or 'data_empirical'; "
                 f"got {mode_var_computation!r}."
             )
+        # Enhanced sampling: the bias only enters the Langevin dynamics of an additional biased trajectory,
+        # exposed as ``train.force_data`` for the force-based losses; ``train.data`` stays unbiased (for DSM).
+        # ``potential``/``force`` stay unbiased, so training targets remain those of the unbiased system.
+        # Intentionally not a dataclass field, so ``repr`` (and the unbiased cache key) is unchanged.
+        if enhanced is not None and str(enhanced).lower() == "none":
+            enhanced = None
+        if enhanced is not None and enhanced not in MUELLER_BROWN_BIASES:
+            raise ValueError(f"Unknown enhanced sampling bias {enhanced!r}; available: {sorted(MUELLER_BROWN_BIASES)}.")
+        self.enhanced = enhanced
         self.coarse_graining_level = (
             coarse_graining_level
             if isinstance(coarse_graining_level, MuellerBrownCoarseGrainingLevel)
@@ -164,13 +214,42 @@ class MuellerBrownSimulation(Dataset):
     def force(self, xs: jnp.ndarray) -> jnp.ndarray:
         return jax.grad(lambda _x: -self.potential(_x).sum())(xs)
 
+    @property
+    def bias(self) -> Optional[GaussianUmbrellaBias]:
+        return None if self.enhanced is None else MUELLER_BROWN_BIASES[self.enhanced]
+
+    def bias_potential(self, xs: jnp.ndarray) -> jnp.ndarray:
+        """Enhanced-sampling bias ``V(x)``; zero for unbiased datasets."""
+        if self.bias is None:
+            return jnp.zeros(jnp.asarray(xs).reshape(-1, 2).shape[0])
+        return self.bias(xs)
+
+    def biased_force(self, xs: jnp.ndarray) -> jnp.ndarray:
+        """``-grad(u + V)``: only used to generate data, never as a training target."""
+        return jax.grad(lambda _x: -(self.potential(_x) + self.bias_potential(_x)).sum())(xs)
+
     def _get_data(self) -> Tuple[Datapoints, None, None]:
+        # With enhanced sampling, DSM trains on the unbiased trajectory (``data``), while the force-based
+        # terms (TSM, SC anchor) use the biased trajectory (``force_data``) with unbiased forces.
+        data = self._load_or_generate_trajectory(biased=False)
+        force_data = self._load_or_generate_trajectory(biased=True) if self.bias is not None else None
+
+        if self._coordinate_index is not None:
+            # Forces are projected from the full frames paired with the force positions.
+            self._train_force_coordinates = data if force_data is None else force_data
+            data = data[:, self._coordinate_index : self._coordinate_index + 1]
+            if force_data is not None:
+                force_data = force_data[:, self._coordinate_index : self._coordinate_index + 1]
+        return Datapoints(data, None, force_data=force_data), None, None
+
+    def _load_or_generate_trajectory(self, biased: bool) -> jnp.ndarray:
         key = jax.random.PRNGKey(self.seed)
 
         dir = os.path.join(get_persistent_storage(), "MuellerBrown")
         os.makedirs(dir, exist_ok=True)
         sha256 = hashlib.sha256()
-        sha256.update(repr(self).encode("utf-8"))
+        cache_key = f"{repr(self)}|enhanced={self.enhanced}:{self.bias!r}" if biased else repr(self)
+        sha256.update(cache_key.encode("utf-8"))
 
         file_name = f"{sha256.hexdigest()}.npy"
         data = None
@@ -183,16 +262,12 @@ class MuellerBrownSimulation(Dataset):
                 log.warning(f"Failed to load data: {e}")
 
         if data is None:
-            log.info(f"Generating data for {self.name} dataset.")
-            data = self._generate_data(key)
+            log.info(f"Generating data for {self.name} dataset" + (f" with bias {self.enhanced}." if biased else "."))
+            data = self._generate_data(key, self.biased_force if biased else self.force)
             jnp.save(os.path.join(dir, file_name), data)
+        return data
 
-        if self._coordinate_index is not None:
-            self._train_force_coordinates = data
-            data = data[:, self._coordinate_index : self._coordinate_index + 1]
-        return Datapoints(data, None), None, None
-
-    def _generate_data(self, key):
+    def _generate_data(self, key, force):
         key, velocity_key = jax.random.split(key)
 
         starting_point = jnp.array([-0.55828035, 1.44169])
@@ -200,7 +275,7 @@ class MuellerBrownSimulation(Dataset):
         starting_velocity = jnp.sqrt(self.kbT / self.full_mass) * jax.random.normal(velocity_key, (2,))
 
         step = jax.jit(
-            create_langevin_step_function(self.force, self.full_mass, self.gamma, self.n_steps, self.dt, self.kbT)
+            create_langevin_step_function(force, self.full_mass, self.gamma, self.n_steps, self.dt, self.kbT)
         )
         trajectory, _ = simulate(starting_point, starting_velocity, step, self.n_samples, key)
         return trajectory

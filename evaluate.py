@@ -52,6 +52,7 @@ class EvaluationSettings:
     only_store_results: bool = False  # If this is true, we only store the results with minimal evaluation.
     run_full_iid_eval: bool = True  # Whether to run the traditional iid sample evaluation (denoising fully to t=0)
     partial_denoise_eval_ts: Sequence[float] = ()  # Additional times to stop the reverse diffusion at (e.g. (0.1, 0.05, 0.01)) for partial-denoise iid sample evaluation
+    mueller_brown_partial_denoise_t0s: Optional[Sequence[float]] = None  # Deprecated alias kept for backward compatibility with older configs.
 
 
 def evaluate(
@@ -140,7 +141,10 @@ def evaluate(
                 dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, ground_truth_marginals,
                 seed=evaluation.seed,
             )
-            if evaluation.mueller_brown_partial_denoise_t0s:
+            mueller_brown_partial_denoise_t0s = evaluation.mueller_brown_partial_denoise_t0s
+            if mueller_brown_partial_denoise_t0s is None:
+                mueller_brown_partial_denoise_t0s = evaluation.partial_denoise_eval_ts
+            if mueller_brown_partial_denoise_t0s:
                 metrics |= evaluate_mueller_brown_partial_denoising(
                     dataset.train,
                     dataset,
@@ -148,7 +152,7 @@ def evaluate(
                     norm_factor,
                     out_dir,
                     ground_truth_marginals,
-                    t0s=(0.0, *evaluation.mueller_brown_partial_denoise_t0s),
+                    t0s=(0.0, *mueller_brown_partial_denoise_t0s),
                     seed=evaluation.seed,
                 )
             metrics |= simulate_mueller_brown(

@@ -403,7 +403,9 @@ def evaluate_langevin_samples(
             )
 
     target_phi_psi = jnp.stack([*dataset.get_2d_features(dataset.train.data)], axis=1)
-    sampled_phi_psi = jnp.stack([*dataset.get_2d_features(trajectories)], axis=1)
+    sampled_phi_psi = jnp.stack(
+        [*dataset.get_2d_features(trajectories.reshape(-1, *dataset.sample_shape))], axis=1
+    )
 
     rms_fe_sq_error, rms_mjs_error = phi_psi_metrics(
         target_phi, target_psi, sampled_phi_psi[:, 0], sampled_phi_psi[:, 1], n_bins=64

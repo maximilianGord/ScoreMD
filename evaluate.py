@@ -36,6 +36,7 @@ DPI = 200
 @dataclass
 class EvaluationSettings:
     seed: Optional[int] = None  # The seed for the evaluation, if None, we use the seed from the training
+    use_ema: bool = True  # Whether to evaluate with the EMA parameters (True) or the raw training parameters (False)
     inference_bs: Optional[int] = None  # The batch size for inference
     fp_inference_bs: Optional[int] = None  # The batch size for FP inference (often we need a smaller number here.)
     num_iid_samples: Optional[int] = None  # The number of iid samples to generate

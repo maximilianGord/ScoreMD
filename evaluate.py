@@ -21,7 +21,7 @@ from scoremd.data.dataset import ToyDataset, ToyDatasets, Dataset, ALDPDataset, 
 from scoremd.models.mixture import MixtureOfModels
 from scoremd.rmsd import kabsch_align_many
 from scoremd.simulation import create_langevin_step_function, simulate
-from scoremd.utils.evaluation import helper_metrics_2d, js_divergence
+from scoremd.utils.evaluation import helper_metrics_1d, helper_metrics_2d, js_divergence
 from scoremd.utils.plots import plot_force_2d, plot_potential_2d, save_parts_of_figure
 from flax.core import FrozenDict
 import numpy as onp
@@ -55,27 +55,26 @@ class EvaluationSettings:
     mueller_brown_partial_denoise_t0s: Optional[Sequence[float]] = None  # Deprecated alias kept for backward compatibility with older configs.
 
 
-def evaluate(
-    model: MixtureOfModels,
-    params: FrozenDict[str, Any],
-    dataset: Dataset,
-    evaluation: EvaluationSettings,
-    orig_BS: int,
-    norm_factor: jnp.ndarray,
-    wandb: bool,
-    out_dir: str,
-    tsm_force_contribution: str = "absolute",
-):
-    sde = sdes.VP()
-    if tsm_force_contribution not in ("absolute", "relative"):
-        raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
-    use_relative_force_transform = tsm_force_contribution == "relative"
-    BS = orig_BS if evaluation.inference_bs is None else evaluation.inference_bs
-    num_langevin_samples = (
+def num_langevin_samples_for(dataset: Dataset, evaluation: EvaluationSettings) -> int:
+    return (
         min(dataset.train.data.shape[0], 1_000_000)
         if evaluation.num_langevin_samples is None
         else evaluation.num_langevin_samples
     )
+
+
+def make_score_and_force(
+    model: MixtureOfModels,
+    params: FrozenDict[str, Any],
+    dataset: Dataset,
+    evaluation: EvaluationSettings,
+    norm_factor: jnp.ndarray,
+    tsm_force_contribution: str = "absolute",
+) -> tuple[Callable, Callable]:
+    """Return the unnormalized score used for sampling and the (scaled) force used for simulation."""
+    if tsm_force_contribution not in ("absolute", "relative"):
+        raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
+    use_relative_force_transform = tsm_force_contribution == "relative"
 
     def trained_unnormalized_score(x, features, t, *args, **kwargs):
         """The trained score function without any normalization. This is used for sampling."""
@@ -92,6 +91,27 @@ def evaluate(
         if use_relative_force_transform:
             normalized_force = inverse_relative_force_transform(normalized_force)
         return normalized_force * norm_factor
+
+    return trained_unnormalized_score, force
+
+
+def evaluate(
+    model: MixtureOfModels,
+    params: FrozenDict[str, Any],
+    dataset: Dataset,
+    evaluation: EvaluationSettings,
+    orig_BS: int,
+    norm_factor: jnp.ndarray,
+    wandb: bool,
+    out_dir: str,
+    tsm_force_contribution: str = "absolute",
+):
+    sde = sdes.VP()
+    BS = orig_BS if evaluation.inference_bs is None else evaluation.inference_bs
+    num_langevin_samples = num_langevin_samples_for(dataset, evaluation)
+    trained_unnormalized_score, force = make_score_and_force(
+        model, params, dataset, evaluation, norm_factor, tsm_force_contribution
+    )
 
     potential = None
     # check if the model has an energy function, and then define it
@@ -120,20 +140,9 @@ def evaluate(
             metrics |= evaluate_toy_normalization_constant(model, params, out_dir)
     elif isinstance(dataset, MuellerBrownSimulation):
         if dataset.is_coarse_grained:
-            metrics |= evaluate_mueller_brown_marginal_samples(
-                dataset.train, dataset, trained_unnormalized_score, norm_factor, out_dir, seed=evaluation.seed
+            metrics |= evaluate_mueller_brown_cg(
+                dataset, trained_unnormalized_score, force, norm_factor, evaluation, num_langevin_samples, out_dir
             )
-            if num_langevin_samples > 0:
-                metrics |= simulate_mueller_brown_marginal(
-                    dataset.train,
-                    dataset,
-                    force,
-                    out_dir,
-                    n_samples=num_langevin_samples,
-                    n_intermediate_steps=evaluation.num_langevin_intermediate_steps,
-                    langevin_dt=evaluation.langevin_dt,
-                    seed=evaluation.seed,
-                )
         else:
             metrics |= evaluate_mueller_brown(dataset, force, potential, out_dir)
             ground_truth_marginals = mueller_brown_marginals(dataset)
@@ -322,9 +331,19 @@ def evaluate(
     if wandb and len(metrics) > 0:
         wandb_lib.log(metrics)
 
-    # write metrics to file, merging with any metrics already present so that a
-    # partial rerun (e.g. only recomputing the partial-denoise metrics) does not
-    # discard metrics computed by a previous, more complete run.
+    write_metrics(metrics, out_dir)
+
+    log.info(f"Metrics: {metrics}")
+    log.info(f"Finished evaluation. You can find the results in {out_dir}")
+    return metrics
+
+
+def write_metrics(metrics: dict, out_dir: str) -> None:
+    """Write metrics to ``out_dir/metrics.json``, merging with any metrics already present.
+
+    This way a partial rerun (e.g. only recomputing the partial-denoise metrics) does not
+    discard metrics computed by a previous, more complete run.
+    """
     metrics_path = os.path.join(out_dir, "metrics.json")
     merged_metrics = {}
     if os.path.exists(metrics_path):
@@ -341,10 +360,6 @@ def evaluate(
 
     with open(metrics_path, "w") as f:
         json.dump(merged_metrics, f)
-
-    log.info(f"Metrics: {metrics}")
-    log.info(f"Finished evaluation. You can find the results in {out_dir}")
-    return metrics
 
 
 def evaluate_fp_loss(
@@ -799,6 +814,40 @@ def evaluate_toy_samples(
     return {"eval/iid_js_divergence": js_divergence(datapoints.data, q_samples, bins=100)}
 
 
+def evaluate_mueller_brown_cg(
+    dataset: MuellerBrownSimulation,
+    score: Callable,
+    force: Callable,
+    norm_factor: jnp.ndarray,
+    evaluation: EvaluationSettings,
+    num_langevin_samples: int,
+    out_dir: str,
+) -> dict:
+    """All metrics of a one-dimensional coarse-grained Müller--Brown model (IID samples and Langevin)."""
+    metrics = evaluate_mueller_brown_marginal_samples(
+        dataset.train, dataset, score, norm_factor, out_dir, seed=evaluation.seed
+    )
+    if num_langevin_samples > 0:
+        metrics |= simulate_mueller_brown_marginal(
+            dataset.train,
+            dataset,
+            force,
+            out_dir,
+            n_samples=num_langevin_samples,
+            n_intermediate_steps=evaluation.num_langevin_intermediate_steps,
+            langevin_dt=evaluation.langevin_dt,
+            seed=evaluation.seed,
+        )
+    return metrics
+
+
+def _mueller_brown_cg_limits(dataset: MuellerBrownSimulation) -> tuple[float, float]:
+    """Plotting/binning range of the retained CG coordinate."""
+    coordinate_index = 0 if dataset.coordinate_name == "x" else 1
+    low, high = onp.asarray(dataset.range())[coordinate_index]
+    return float(low), float(high)
+
+
 def mueller_brown_marginal(dataset: MuellerBrownSimulation, n_grid: int = 512) -> tuple[onp.ndarray, onp.ndarray]:
     """Integrate out the discarded coordinate to obtain the configured CG density."""
     if not dataset.is_coarse_grained:
@@ -835,7 +884,14 @@ def evaluate_mueller_brown_marginal_samples(
     mixture = (p + q) / 2
     mask_p, mask_q = p > 0, q > 0
     js_divergence_1d = 0.5 * (onp.sum(p[mask_p] * onp.log(p[mask_p] / mixture[mask_p])) + onp.sum(q[mask_q] * onp.log(q[mask_q] / mixture[mask_q])))
-    return {"eval/iid_js_divergence": float(js_divergence_1d)}
+    limits = _mueller_brown_cg_limits(dataset)
+    rms_fe_sq_error, rms_mjs_error = helper_metrics_1d(truth, samples, limits)
+    return {
+        "eval/iid_js_divergence": float(js_divergence_1d),
+        "eval/iid_rms_fe_sq_error": float(rms_fe_sq_error),
+        "eval/iid_rms_mjs_error": float(rms_mjs_error),
+        "eval/iid_outlier_fraction": float(onp.mean((samples < limits[0]) | (samples > limits[1]))),
+    }
 
 
 def _marginal_histogram_js(
@@ -923,9 +979,12 @@ def simulate_mueller_brown_marginal(
     fig.savefig(f"{out_dir}/mueller-brown-{dataset.coordinate_name}-langevin-marginal.png", bbox_inches="tight")
     plt.close(fig)
 
+    rms_fe_sq_error, rms_mjs_error = helper_metrics_1d(truth, samples, _mueller_brown_cg_limits(dataset))
     return {
         "eval/langevin_marginal_js_divergence": js_divergence_1d,
         "eval/langevin_marginal_outlier_fraction": outlier_fraction,
+        "eval/langevin_rms_fe_sq_error": float(rms_fe_sq_error),
+        "eval/langevin_rms_mjs_error": float(rms_mjs_error),
     }
 
 

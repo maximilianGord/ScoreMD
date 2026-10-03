@@ -291,6 +291,29 @@ def helper_metrics_2d(target_x, target_y, sampled_x, sampled_y, limits_x, limits
     return rms_fe_sq_error, rms_mjs_error
 
 
+def helper_metrics_1d(target, sampled, limits, n_bins=64):
+    """One-dimensional counterpart of ``helper_metrics_2d`` (same binning, baseline, and weighting).
+
+    Samples outside ``limits`` land in the two outlier bins of ``discretize`` and are thus penalized.
+    """
+    data_df = pd.DataFrame({"x": np.asarray(target).flatten()})
+    model_df = pd.DataFrame({"x": np.asarray(sampled).flatten()})
+    kwargs = dict(
+        left=model_df,
+        right=data_df,
+        n_bins=n_bins,
+        density=False,
+        baseline=1e-6,
+        limits=[limits],
+        columns=["x"],
+        weight="mix",
+        outlier_check=False,
+    )
+    rms_fe_sq_error = grid_pointwise(loss=fe_sq_error, **kwargs)
+    rms_mjs_error = grid_pointwise(loss=mjs_error, **kwargs)
+    return rms_fe_sq_error, rms_mjs_error
+
+
 def phi_psi_metrics(target_phi, target_psi, sampled_phi, sampled_psi, n_bins=64):
     return helper_metrics_2d(
         target_phi,

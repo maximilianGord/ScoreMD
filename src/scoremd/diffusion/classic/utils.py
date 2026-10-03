@@ -423,11 +423,10 @@ def get_loss(
                 raise ValueError("loss_type='sc' requires precomputed per-sample forces for the force anchor.")
             if score_fn is None:
                 raise ValueError("loss_type='sc' requires an EMA teacher score function.")
-            if tsm_type == "mode_mixture" and sg_type == "mode_mixture":
-                raise ValueError(
-                    "loss_type='sc' cannot use tsm_type='mode_mixture' together with "
-                    "sg_type='mode_mixture': both would reweight the DSM term via their own kappa."
-                )
+            # loss_type='sc' never adds the schedule-based TSM term (tsm_type/tsm_lambda/...);
+            # forces only enter through the t=0 anchor below or, with sc_switch, through the
+            # sg_lambda-weighted TSM term for sigma_t <= force_sigma_max.
+            diffusion_loss = reduce_op(losses)
             if not sc_switch:
                 # TODO : Change the hardcoded t_0 = 0
                 t0 = jnp.zeros_like(ts)
@@ -453,57 +452,6 @@ def get_loss(
                 )
                 tsm_component = reduce_op(force_anchor_losses)
             # else: sc_switch folds the t=0 anchor into the switched sc term below instead.
-
-            # Regular schedule-based TSM term (same tsm_type/tsm_lambda/tsm_t0/tsm_sigma_max/
-            # tsm_force_contribution as loss_type='tsm'), evaluated at the sampled (perturbed_data, ts)
-            # rather than the fixed t=0 anchor above. Additive with the t=0 force anchor.
-            if tsm_type == "mode_mixture":
-                target_score_losses, kappas, lambdas = tsm_loss(
-                    error_rng,
-                    sde,
-                    force_score,
-                    force_perturbed_data,
-                    forces,
-                    features,
-                    ts,
-                    time_weighting,
-                    tsm_type,
-                    tsm_lambda,
-                    tsm_t0,
-                    tsm_sigma_max,
-                    tsm_force_contribution=tsm_force_contribution,
-                    sigma_data=sigma_data,
-                    sigma_mode_sq=effective_sigma_mode_sq,
-                    kbT=kbT,
-                    lambda_scheme=tsm_lambda_scheme,
-                    reduce=reduce_op,
-                )
-                weighted_losses = losses * kappas * lambdas
-                weighted_target_score_losses = target_score_losses * (1 - kappas)
-                diffusion_loss = reduce_op(weighted_losses)
-                tsm_component = tsm_component + reduce_op(weighted_target_score_losses)
-            else:
-                target_score_losses, _, _ = tsm_loss(
-                    error_rng,
-                    sde,
-                    force_score,
-                    force_perturbed_data,
-                    forces,
-                    features,
-                    ts,
-                    time_weighting,
-                    tsm_type,
-                    tsm_lambda,
-                    tsm_t0,
-                    tsm_sigma_max,
-                    tsm_force_contribution=tsm_force_contribution,
-                    sigma_data=sigma_data,
-                    sigma_mode_sq=effective_sigma_mode_sq,
-                    kbT=kbT,
-                    reduce=reduce_op,
-                )
-                diffusion_loss = reduce_op(losses)
-                tsm_component = tsm_component + reduce_op(target_score_losses)
 
             s_rng, posterior_rng = jax.random.split(error_rng)
             #TODO change hard coded t_min to a parameter
@@ -579,14 +527,12 @@ def get_loss(
                 sc_component = sc_per_sample * (1 - kappas_sg)
                 combined_per_sample = jnp.where(is_anchor, anchor_component, sc_component)
                 sc_loss = reduce_op(combined_per_sample)
-                if tsm_type != "mode_mixture":
-                    diffusion_loss = reduce_op(losses * dsm_weight)
+                diffusion_loss = reduce_op(losses * dsm_weight)
 
             elif sc_switch:
-                # Anchor (near t=0) and sc (semigroup consistency, t>0) are two different
-                # per-sample formulas, but share the same (sg_type, sg_lambda, sg_t0,
-                # sg_sigma_max) weight schedule; force_sigma_max decides which one applies
-                # per sample, based on the noise scale sigma_t rather than raw time.
+                # sigma_t <= force_sigma_max: TSM with a flat sg_lambda weight.
+                # sigma_t >  force_sigma_max: semigroup consistency with the
+                # (sg_type, sg_lambda, sg_t0, sg_sigma_max) schedule.
                 anchor_losses, _, _ = tsm_loss(
                     error_rng,
                     sde,
@@ -596,7 +542,7 @@ def get_loss(
                     features,
                     ts,
                     time_weighting,
-                    sg_type,
+                    "constant",
                     sg_lambda,
                     sg_t0,
                     sg_sigma_max,
@@ -626,8 +572,6 @@ def get_loss(
                 is_anchor = std <= force_sigma_max
                 combined_per_sample = jnp.where(is_anchor, anchor_losses, sc_per_sample)
                 sc_loss = reduce_op(combined_per_sample)
-                if tsm_type != "mode_mixture":
-                    diffusion_loss = reduce_op(losses)
 
             elif sg_type == "mode_mixture":
                 sc_per_sample, kappas_sg, lambdas_sg = semigroup_consistency_loss(
@@ -676,10 +620,6 @@ def get_loss(
                     reduce=reduce_op,
                 )
                 sc_loss = reduce_op(sc_per_sample)
-                if tsm_type != "mode_mixture":
-                    # Otherwise diffusion_loss is already correctly kappa-weighted above;
-                    # tsm_type='mode_mixture' and sg_type='mode_mixture' are mutually exclusive.
-                    diffusion_loss = reduce_op(losses)
 
         return gamma * diffusion_loss, vector_fp, scalar_fp, tsm_component, sc_loss
 

@@ -256,6 +256,138 @@ def compute_full_atom_sigma_mode(dataset, **kwargs) -> float | tuple[float, dict
     return compute_sigma_mode(frames, dataset.force, beta=1.0 / float(dataset.kbT), **kwargs)
 
 
+def full_atom_hessians(frames: Array, force_fn: Callable[[Array], Array], *, eps: float = 1e-4) -> Array:
+    """Full Cartesian Hessians of U (kJ/(mol nm²)) by central differences of ``force_fn``.
+
+    ``frames`` has shape ``(n_frames, n_atoms, 3)`` in nm; the result has shape
+    ``(n_frames, 3 n_atoms, 3 n_atoms)`` and is symmetrized. Costs ``6 n_atoms`` force calls per frame.
+    """
+    frames = np.asarray(frames, dtype=float)
+    if frames.ndim != 3 or frames.shape[-1] != 3:
+        raise ValueError(f"frames must have shape (n_frames, n_atoms, 3); got {frames.shape}.")
+    if not np.isfinite(eps) or eps <= 0.0:
+        raise ValueError("eps must be a positive finite displacement in nm.")
+    n_frames, n_atoms, _ = frames.shape
+    dim = 3 * n_atoms
+    hessians = np.empty((n_frames, dim, dim))
+    for k, frame in enumerate(frames):
+        flat = frame.reshape(-1)
+        for j in range(dim):
+            plus, minus = flat.copy(), flat.copy()
+            plus[j] += eps
+            minus[j] -= eps
+            f_plus = np.asarray(force_fn(plus.reshape(n_atoms, 3)), dtype=float).reshape(-1)
+            f_minus = np.asarray(force_fn(minus.reshape(n_atoms, 3)), dtype=float).reshape(-1)
+            hessians[k, :, j] = -(f_plus - f_minus) / (2.0 * eps)
+    return 0.5 * (hessians + np.swapaxes(hessians, -1, -2))
+
+
+def schur_sigma_mode_from_hessians(
+    hessians: Array,
+    kept_atoms: Optional[Array],
+    *,
+    beta: float,
+    floor_width: float = 0.05,
+) -> tuple[float, dict[str, Any]]:
+    """Stiffness-weighted mode variance of the (coarse-grained) marginal from full-atom Hessians.
+
+    For a local Gaussian p(x) ~ exp(-beta/2 dx^T H dx), the marginal of the kept coordinates x_h has
+    precision beta * S with the Schur complement S = H_hh - H_hH H_HH^{-1} H_Hh, i.e. the eliminated
+    atoms are integrated out instead of frozen (H_hh alone would be the conditional precision with
+    the eliminated atoms held fixed, which is too stiff for a CG model). Without eliminated atoms
+    S = H.
+
+    The estimate is ``1 / (beta * mean(diag S))`` over frames and kept coordinates. Averaging the
+    curvatures before inverting weights the stiff directions, which is what bounds the mode-mixture
+    weight; averaging 1/curvature instead lets the soft directions dominate.
+
+    Eliminated-atom modes whose curvature is below ``beta^-1 / floor_width²`` (soft or locally unstable,
+    e.g. methyl rotations away from a minimum) are clipped to that curvature before inversion.
+    Units: Hessians in kJ/(mol nm²), ``beta`` in mol/kJ, ``floor_width`` and the result in nm / nm².
+    """
+    hessians = np.asarray(hessians, dtype=float)
+    if hessians.ndim != 3 or hessians.shape[1] != hessians.shape[2] or hessians.shape[1] % 3 != 0:
+        raise ValueError(f"hessians must have shape (n_frames, 3 n_atoms, 3 n_atoms); got {hessians.shape}.")
+    if not np.isfinite(beta) or beta <= 0.0:
+        raise ValueError("beta must be positive and finite.")
+    if not np.isfinite(floor_width) or floor_width <= 0.0:
+        raise ValueError("floor_width must be a positive finite width in nm.")
+    n_atoms = hessians.shape[1] // 3
+    kept = np.arange(n_atoms) if kept_atoms is None else np.asarray(kept_atoms, dtype=int)
+    eliminated = np.setdiff1d(np.arange(n_atoms), kept)
+    kept_idx = (3 * kept[:, None] + np.arange(3)).reshape(-1)
+    elim_idx = (3 * eliminated[:, None] + np.arange(3)).reshape(-1)
+    floor = 1.0 / (beta * floor_width**2)
+
+    diag_s, n_clipped, n_negative_diag = [], 0, 0
+    for H in hessians:
+        S = H[np.ix_(kept_idx, kept_idx)]
+        if elim_idx.size:
+            coupling = H[np.ix_(kept_idx, elim_idx)]
+            w, V = np.linalg.eigh(H[np.ix_(elim_idx, elim_idx)])
+            n_clipped += int(np.sum(w < floor))
+            S = S - (coupling @ V / np.maximum(w, floor)) @ (V.T @ coupling.T)
+        d = np.diag(S)
+        n_negative_diag += int(np.sum(d <= 0.0))
+        diag_s.append(d)
+    diag_s = np.asarray(diag_s)
+
+    mean_curvature = float(diag_s.mean())
+    if not np.isfinite(mean_curvature) or mean_curvature <= 0.0:
+        raise ValueError(f"Mean Schur curvature must be positive; got {mean_curvature}.")
+    estimate = 1.0 / (beta * mean_curvature)
+    per_atom_curvature = diag_s.reshape(len(diag_s), len(kept), 3).mean(axis=(0, 2))
+    diagnostics: dict[str, Any] = {
+        "estimator": "schur_hessian",
+        "n_frames": int(len(diag_s)),
+        "n_kept_atoms": int(len(kept)),
+        "n_eliminated_atoms": int(len(eliminated)),
+        "mean_curvature": mean_curvature,
+        "frame_sigma2_std_error": float(
+            np.std(1.0 / (beta * diag_s.mean(axis=1)), ddof=1) / np.sqrt(len(diag_s))
+        )
+        if len(diag_s) > 1
+        else 0.0,
+        "min_atom_sigma": float(np.sqrt(1.0 / (beta * per_atom_curvature.max()))),
+        "max_atom_sigma": float(np.sqrt(1.0 / (beta * per_atom_curvature.min()))),
+        "clipped_eliminated_mode_fraction": float(n_clipped / max(1, len(diag_s) * elim_idx.size)),
+        "nonpositive_diag_fraction": float(n_negative_diag / diag_s.size),
+    }
+    return float(estimate), diagnostics
+
+
+def compute_schur_hessian_sigma_mode(
+    dataset,
+    *,
+    n_subsample: int = 200,
+    eps: float = 1e-4,
+    floor_width: float = 0.05,
+    seed: Optional[int] = 0,
+) -> tuple[float, dict[str, Any]]:
+    """``schur_hessian`` mode variance (nm²) for a dataset with full-atom frames and a kept-atom selection.
+
+    Uses the paired full-atom training frames (ALDP keeps them for force preprocessing), computes full
+    Hessians with ``dataset.force`` and integrates out the atoms not in ``dataset._atoms_to_keep``.
+    """
+    if not hasattr(dataset, "force") or not callable(dataset.force):
+        raise TypeError("Dataset must provide a callable force(frame) for Hessian estimation.")
+    if n_subsample <= 0:
+        raise ValueError("n_subsample must be positive.")
+    datapoints = dataset.train
+    full = dataset.force_coordinates_for(datapoints) if hasattr(dataset, "force_coordinates_for") else None
+    if full is None:
+        full = datapoints.data
+    frames = np.asarray(full, dtype=float).reshape((len(datapoints), -1, 3))
+    rng = np.random.default_rng(seed)
+    frames = frames[rng.choice(len(frames), size=min(n_subsample, len(frames)), replace=False)]
+
+    hessians = full_atom_hessians(frames, dataset.force, eps=eps)
+    kept = getattr(dataset, "_atoms_to_keep", None)
+    if kept is not None and len(kept) == frames.shape[1]:
+        kept = None
+    return schur_sigma_mode_from_hessians(hessians, kept, beta=1.0 / float(dataset.kbT), floor_width=floor_width)
+
+
 def compute_empirical_sigma_mode(dataset) -> float:
     """Return the mean coordinate variance of centered training datapoints."""
     data = np.asarray(dataset.train.data, dtype=float).reshape((len(dataset.train), -1))

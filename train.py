@@ -183,6 +183,10 @@ def _prepare_tsm_inputs(
             diagnostics = {"source": "potential", "mode": "global_minimum"}
         elif mode_var_computation == "data_hessian":
             sigma_mode_sq, diagnostics = compute_full_atom_sigma_mode(dataset, return_diagnostics=True)
+        elif mode_var_computation == "schur_hessian":
+            from scoremd.data.dataset.utils import compute_schur_hessian_sigma_mode
+
+            sigma_mode_sq, diagnostics = compute_schur_hessian_sigma_mode(dataset)
         elif mode_var_computation == "data_empirical":
             from scoremd.data.dataset.utils import compute_empirical_sigma_mode
 
@@ -216,7 +220,7 @@ def _prepare_tsm_inputs(
             diagnostics = {"source": "data", "estimator": "gaussian_mixture_per_sample", **diagnostics}
         else:
             raise ValueError(
-                "dataset.mode_var_computation must be 'potential', 'data_hessian', 'data_empirical', "
+                "dataset.mode_var_computation must be 'potential', 'data_hessian', 'schur_hessian', 'data_empirical', "
                 "'cg_local_covariance', 'gmm', or 'gmm_per_sample'; "
                 f"got {mode_var_computation!r}."
             )

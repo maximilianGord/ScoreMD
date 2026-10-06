@@ -42,7 +42,7 @@ class ALDPDataset(Dataset):
     path: Optional[PathLike] = None  # Can be used to load a custom dataset
     seed: int = 0
     mode_var_computation: Literal[
-        "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+        "data_hessian", "schur_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
     ] = "data_hessian"
     gmm_n_components: Optional[int] = None
     gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full"
@@ -57,7 +57,7 @@ class ALDPDataset(Dataset):
         validation: bool = True,
         seed: int = 0,
         mode_var_computation: Literal[
-            "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+            "data_hessian", "schur_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
         ] = "data_hessian",
         gmm_n_components: Optional[int] = None,
         gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full",
@@ -65,10 +65,10 @@ class ALDPDataset(Dataset):
         name="aldp",
     ):
         if mode_var_computation not in {
-            "data_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
+            "data_hessian", "schur_hessian", "data_empirical", "cg_local_covariance", "gmm", "gmm_per_sample"
         }:
             raise ValueError(
-                "mode_var_computation must be 'data_hessian', 'data_empirical', "
+                "mode_var_computation must be 'data_hessian', 'schur_hessian', 'data_empirical', "
                 f"'cg_local_covariance', 'gmm', or 'gmm_per_sample'; got {mode_var_computation!r}."
             )
         if gmm_n_components is not None and gmm_n_components <= 0:

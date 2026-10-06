@@ -116,6 +116,12 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     )
     forces = np.empty_like(target_frames)
     log.info("Precomputing physical forces for %d TSM/SC samples.", len(target_frames))
+    if hasattr(dataset, "batched_forces"):
+        # Analytic potentials: one jitted, vectorized call instead of a Python loop over frames.
+        forces[:] = np.asarray(dataset.batched_forces(jnp.asarray(force_frames)), dtype=target_frames.dtype).reshape(
+            target_frames.shape
+        )
+        force_frames = []
     for index, (target_frame, force_frame) in enumerate(zip(target_frames, force_frames)):
         force = np.asarray(dataset.force(jnp.asarray(force_frame)), dtype=target_frames.dtype)
         if force.shape != target_frame.shape:

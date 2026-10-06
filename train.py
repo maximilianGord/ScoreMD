@@ -490,9 +490,10 @@ def training_routine(
     }
     if len(tsm_force_contributions) > 1:
         raise ValueError("Evaluation cannot combine absolute and relative TSM force contributions.")
+    log.info(f"Evaluating with {'EMA' if evaluation.use_ema else 'raw (non-EMA)'} parameters")
     evaluate(
         unified_model,
-        state.ema_params,
+        state.ema_params if evaluation.use_ema else state.params,
         dataset,
         evaluation,
         BS // num_devices,  # This uses only a single GPU for evaluation

@@ -974,7 +974,6 @@ def simulate_mueller_brown_marginal(
     axis.plot(coordinates, density, label="Potential-integrated ground truth", linewidth=2)
     axis.hist(samples, bins=coordinates, density=True, histtype="step", linewidth=2, label="Langevin samples")
     axis.set(xlabel=dataset.coordinate_name, ylabel="Marginal density")
-    axis.set_title(f"Outside plotted range: {outlier_fraction:.2%}")
     axis.legend()
     fig.tight_layout()
     fig.savefig(f"{out_dir}/mueller-brown-{dataset.coordinate_name}-langevin-marginal.png", bbox_inches="tight")

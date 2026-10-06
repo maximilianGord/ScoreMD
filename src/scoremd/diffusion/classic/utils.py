@@ -356,6 +356,14 @@ def get_loss(
             losses *= time_weighting(ts)
             diffusion_loss = jnp.mean(losses)  # scalar
 
+            # DSM error in score units, |s + eps / sigma_t|^2. The mode-mixture kappa mixes DSM with
+            # TSM / semigroup terms, which are in score units, so it must use this instead of the
+            # noise-unit |eps + sigma_t s|^2 = sigma_t^2 |s + eps / sigma_t|^2 above. kappa / sigma_t^2
+            # stays bounded (<= 1 / (alpha_t^2 sigma_mode^2)), so this does not blow up at small t.
+            e_score = e if likelihood_weighting else batch_mul(e, 1.0 / std)
+            score_unit_losses = reduce_op(jnp.square(e_score).reshape((e_score.shape[0], -1)), axis=-1)
+            score_unit_losses *= time_weighting(ts)
+
         # Positions for the force-based terms (TSM, SC force anchor). By default the forces belong to
         # ``batch``; with ``force_batch`` (enhanced sampling) they belong to separately sampled (biased)
         # positions, perturbed at the same times ``ts``, while DSM and the semigroup term keep ``batch``.
@@ -391,7 +399,7 @@ def get_loss(
                     reduce=reduce_op,
                 )
                 #combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
-                weighted_losses = losses*kappas*lambdas
+                weighted_losses = score_unit_losses * kappas * lambdas
                 weighted_target_score_losses = target_score_losses*(1-kappas)
                 diffusion_loss = reduce_op(weighted_losses)
                 tsm_component = reduce_op(weighted_target_score_losses)
@@ -527,7 +535,7 @@ def get_loss(
                 sc_component = sc_per_sample * (1 - kappas_sg)
                 combined_per_sample = jnp.where(is_anchor, anchor_component, sc_component)
                 sc_loss = reduce_op(combined_per_sample)
-                diffusion_loss = reduce_op(losses * dsm_weight)
+                diffusion_loss = reduce_op(score_unit_losses * dsm_weight)
 
             elif sc_switch:
                 # sigma_t <= force_sigma_max: TSM with a flat sg_lambda weight.
@@ -596,7 +604,7 @@ def get_loss(
                 # consistency are complementary estimators, mixed by kappa.
                 # ``sc_per_sample`` already contains lambda_st, whereas
                 # ``losses`` only contains the ordinary time weighting.
-                weighted_losses = losses * kappas_sg * lambdas_sg
+                weighted_losses = score_unit_losses * kappas_sg * lambdas_sg
                 weighted_consistent_semigroup_losses = sc_per_sample * (1 - kappas_sg)
                 sc_loss = reduce_op(weighted_consistent_semigroup_losses)
                 diffusion_loss = reduce_op(weighted_losses)

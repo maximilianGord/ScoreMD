@@ -96,6 +96,48 @@ MUELLER_BROWN_BIASES = {
 }
 
 
+@dataclass(frozen=True)
+class UmbrellaWindows:
+    """Harmonic umbrella windows ``V_i(r) = k_spring / 2 * ||r[:bias_dims] - c_i[:bias_dims]||^2``.
+
+    The centers ``c_i`` are ``n_windows`` points interpolated along ``waypoints``. Each window is an
+    independent Langevin trajectory started at its center; the force data is their concatenation.
+    """
+
+    waypoints: Tuple[Tuple[float, float], ...]
+    n_windows: int = 15
+    k_spring: float = 300.0
+    bias_dims: int = 2
+
+    def centers(self) -> jnp.ndarray:
+        waypoints = jnp.asarray(self.waypoints)
+        t_fine = jnp.linspace(0.0, 1.0, self.n_windows)
+        t_coarse = jnp.linspace(0.0, 1.0, waypoints.shape[0])
+        return jnp.stack([jnp.interp(t_fine, t_coarse, waypoints[:, d]) for d in range(2)], axis=-1)
+
+
+# Minimum-energy path from the global minimum (A) via the middle well to the second minimum (B).
+MB_TRANSITION_PATH = (
+    (-0.55, 1.45),
+    (-0.50, 1.20),
+    (-0.40, 0.90),
+    (-0.25, 0.75),
+    (0.00, 0.50),
+    (0.20, 0.35),
+    (0.40, 0.20),
+    (0.55, 0.05),
+    (0.62, 0.02),
+)
+
+# Multi-window umbrella sampling available via ``MuellerBrownSimulation(enhanced=<name>)``.
+MUELLER_BROWN_WINDOWS = {
+    # 15 windows restrained in x and y, k = 300 -> restraint std sqrt(kbT / k) ~ 0.28 at kbT = 23.
+    "windows": UmbrellaWindows(MB_TRANSITION_PATH),
+    # Same windows, restrained in x only (y is free, like the 1D bias_* umbrellas).
+    "windows_x": UmbrellaWindows(MB_TRANSITION_PATH, bias_dims=1),
+}
+
+
 @dataclass
 class MuellerBrownSimulation(Dataset):
     n_samples: int = 10_000
@@ -134,8 +176,9 @@ class MuellerBrownSimulation(Dataset):
         # Intentionally not a dataclass field, so ``repr`` (and the unbiased cache key) is unchanged.
         if enhanced is not None and str(enhanced).lower() == "none":
             enhanced = None
-        if enhanced is not None and enhanced not in MUELLER_BROWN_BIASES:
-            raise ValueError(f"Unknown enhanced sampling bias {enhanced!r}; available: {sorted(MUELLER_BROWN_BIASES)}.")
+        available = sorted(MUELLER_BROWN_BIASES) + sorted(MUELLER_BROWN_WINDOWS)
+        if enhanced is not None and enhanced not in available:
+            raise ValueError(f"Unknown enhanced sampling bias {enhanced!r}; available: {available}.")
         self.enhanced = enhanced
         self.coarse_graining_level = (
             coarse_graining_level
@@ -214,9 +257,20 @@ class MuellerBrownSimulation(Dataset):
     def force(self, xs: jnp.ndarray) -> jnp.ndarray:
         return jax.grad(lambda _x: -self.potential(_x).sum())(xs)
 
+    def batched_forces(self, full_frames: jnp.ndarray) -> jnp.ndarray:
+        """Forces for a batch of full frames, projected onto the retained CG coordinate if coarse-grained."""
+        forces = jax.jit(self.force)(jnp.asarray(full_frames).reshape(-1, 2))
+        if self._coordinate_index is None:
+            return forces
+        return forces[:, self._coordinate_index : self._coordinate_index + 1]
+
     @property
     def bias(self) -> Optional[GaussianUmbrellaBias]:
-        return None if self.enhanced is None else MUELLER_BROWN_BIASES[self.enhanced]
+        return MUELLER_BROWN_BIASES.get(self.enhanced)
+
+    @property
+    def windows(self) -> Optional[UmbrellaWindows]:
+        return MUELLER_BROWN_WINDOWS.get(self.enhanced)
 
     def bias_potential(self, xs: jnp.ndarray) -> jnp.ndarray:
         """Enhanced-sampling bias ``V(x)``; zero for unbiased datasets."""
@@ -232,7 +286,7 @@ class MuellerBrownSimulation(Dataset):
         # With enhanced sampling, DSM trains on the unbiased trajectory (``data``), while the force-based
         # terms (TSM, SC anchor) use the biased trajectory (``force_data``) with unbiased forces.
         data = self._load_or_generate_trajectory(biased=False)
-        force_data = self._load_or_generate_trajectory(biased=True) if self.bias is not None else None
+        force_data = self._load_or_generate_trajectory(biased=True) if self.enhanced is not None else None
 
         if self._coordinate_index is not None:
             # Forces are projected from the full frames paired with the force positions.
@@ -248,7 +302,8 @@ class MuellerBrownSimulation(Dataset):
         dir = os.path.join(get_persistent_storage(), "MuellerBrown")
         os.makedirs(dir, exist_ok=True)
         sha256 = hashlib.sha256()
-        cache_key = f"{repr(self)}|enhanced={self.enhanced}:{self.bias!r}" if biased else repr(self)
+        enhancement = self.bias if self.bias is not None else self.windows
+        cache_key = f"{repr(self)}|enhanced={self.enhanced}:{enhancement!r}" if biased else repr(self)
         sha256.update(cache_key.encode("utf-8"))
 
         file_name = f"{sha256.hexdigest()}.npy"
@@ -263,7 +318,10 @@ class MuellerBrownSimulation(Dataset):
 
         if data is None:
             log.info(f"Generating data for {self.name} dataset" + (f" with bias {self.enhanced}." if biased else "."))
-            data = self._generate_data(key, self.biased_force if biased else self.force)
+            if biased and self.windows is not None:
+                data = self._generate_window_data(key, self.windows)
+            else:
+                data = self._generate_data(key, self.biased_force if biased else self.force)
             jnp.save(os.path.join(dir, file_name), data)
         return data
 
@@ -279,6 +337,24 @@ class MuellerBrownSimulation(Dataset):
         )
         trajectory, _ = simulate(starting_point, starting_velocity, step, self.n_samples, key)
         return trajectory
+
+    def _generate_window_data(self, key, windows: UmbrellaWindows):
+        """Concatenated trajectories of all umbrella windows, ``ceil(n_samples / n_windows)`` frames each."""
+        key, velocity_key = jax.random.split(key)
+        centers = windows.centers()
+        mask = (jnp.arange(2) < windows.bias_dims).astype(centers.dtype)
+
+        def restrained_force(xs):
+            return self.force(xs) - windows.k_spring * (xs - centers) * mask
+
+        # All windows are simulated at once as a (n_windows, 2) batch, each starting at its center.
+        starting_velocity = jnp.sqrt(self.kbT / self.full_mass) * jax.random.normal(velocity_key, centers.shape)
+        step = jax.jit(
+            create_langevin_step_function(restrained_force, self.full_mass, self.gamma, self.n_steps, self.dt, self.kbT)
+        )
+        frames_per_window = -(-self.n_samples // windows.n_windows)
+        trajectory, _ = simulate(centers, starting_velocity, step, frames_per_window, key)
+        return jnp.swapaxes(trajectory, 0, 1).reshape(-1, 2)[: self.n_samples]
 
     def plot(self, samples: jnp.ndarray, cbar_range: Tuple[float, float] = None, cbar: bool = True):
         assert samples.ndim == 2 and samples.shape[1] == 2, "Data should be a 2D vector."

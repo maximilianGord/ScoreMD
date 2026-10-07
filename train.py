@@ -262,6 +262,12 @@ def _prepare_tsm_inputs(
     val_data = _precompute_forces(dataset, val_data)
     for ranged_loss in force_losses:
         _set_runtime_loss_options(ranged_loss, kbT=float(dataset.kbT))
+        if _loss_options(ranged_loss).get("tsm_project_bonds", False):
+            if not hasattr(dataset, "bond_pairs"):
+                raise ValueError("tsm_project_bonds=True requires a dataset with bond_pairs().")
+            pairs = dataset.bond_pairs()
+            log.info("Projecting %d bond-stretch directions out of the TSM residual.", len(pairs))
+            _set_runtime_loss_options(ranged_loss, bond_pairs=jnp.asarray(pairs))
     return train_data, val_data
 
 

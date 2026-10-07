@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 from typing import Literal
 
-LambdaScheme = Literal["song", "dsm_optimal", "tsm_optimal", "uniform"]
+LambdaScheme = Literal["song", "dsm_optimal", "tsm_optimal", "uniform", "sigma_sq"]
 TSMForceContribution = Literal["absolute", "relative"]
 
 
@@ -43,6 +43,9 @@ def _optimal_tsm_lambda(
             "tsm_optimal" -> unit-variance-at-init weighting for *pure* TSM
             "uniform"     -> lambda_t = 1  (what the paper actually trains
                               kappa/kappa-bar mixtures with — default here)
+            "sigma_sq"    -> lambda_t = sigma_t^2, the weight plain DSM puts on the score error
+                              (|eps + sigma s|^2 = sigma^2 |s + eps/sigma|^2), so the mixture keeps
+                              DSM's time weighting and only redistributes it between DSM and TSM
         eps: numerical floor to avoid division by zero.
 
     Returns:
@@ -68,9 +71,12 @@ def _optimal_tsm_lambda(
     if scheme == "uniform":
         return jnp.ones_like(sigma_sq)
 
+    if scheme == "sigma_sq":
+        return sigma_sq
+
     raise ValueError(
         f"Unknown lambda_t weighting scheme {scheme!r}; expected one of "
-        "('song', 'dsm_optimal', 'tsm_optimal', 'uniform')."
+        "('song', 'dsm_optimal', 'tsm_optimal', 'uniform', 'sigma_sq')."
     )
 
 
@@ -121,6 +127,31 @@ def inverse_relative_force_transform(transformed_force: ArrayLike, eps: float = 
     return transformed_force * scale.reshape((transformed_force.shape[0],) + (1,) * (transformed_force.ndim - 1))
 
 
+def project_out_bond_stretches(residual: ArrayLike, x: ArrayLike, bond_pairs: ArrayLike) -> jnp.ndarray:
+    """Remove the components of ``residual`` along the bond-stretch directions of the frames ``x``.
+
+    For every bond (i, j) the stretch direction is +e on atom i and -e on atom j with e the unit
+    vector from j to i. The span of these directions (the stiffest motions of a molecule) is
+    orthonormalized per sample and projected out. The projector depends only on ``x``, so for
+    ``x = x_t`` the minimizer of the projected least-squares loss in the remaining directions is
+    unchanged (it is still E[target | x_t]); the projected-out directions are left to the other terms.
+    """
+    residual = jnp.asarray(residual)
+    n = residual.shape[0]
+    pos = jnp.asarray(x).reshape((n, -1, 3))
+    pairs = jnp.asarray(bond_pairs, dtype=jnp.int32)
+    e = pos[:, pairs[:, 0]] - pos[:, pairs[:, 1]]
+    e = e / jnp.maximum(jnp.linalg.norm(e, axis=-1, keepdims=True), 1e-12)  # (n, n_bonds, 3)
+    n_atoms, n_bonds = pos.shape[1], pairs.shape[0]
+    basis = jnp.zeros((n, n_atoms, 3, n_bonds), dtype=residual.dtype)
+    bond_idx = jnp.arange(n_bonds)
+    basis = basis.at[:, pairs[:, 0], :, bond_idx].set(jnp.moveaxis(e, 1, 0))
+    basis = basis.at[:, pairs[:, 1], :, bond_idx].add(-jnp.moveaxis(e, 1, 0))
+    q, _ = jnp.linalg.qr(basis.reshape((n, n_atoms * 3, n_bonds)))
+    flat = residual.reshape((n, -1))
+    return (flat - jnp.einsum("nkb,nb->nk", q, jnp.einsum("nkb,nk->nb", q, flat))).reshape(residual.shape)
+
+
 def _as_batch_weights(value: ArrayLike, batch_size: int, dtype, name: str) -> jnp.ndarray:
     """Convert a scalar or per-sample value into a batch-shaped vector."""
     value = jnp.asarray(value, dtype=dtype).reshape(-1)
@@ -149,6 +180,7 @@ def tsm_loss(
     kbT: float = 1.0,
     lambda_scheme: LambdaScheme = "uniform",
     reduce: Callable[[ArrayLike], ArrayLike] = jnp.nanmean,
+    bond_pairs: Optional[ArrayLike] = None,
 ) -> tuple[ArrayLike, ArrayLike]:
     """Compute a time-weighted target score matching loss.
 
@@ -202,7 +234,11 @@ def tsm_loss(
     if tsm_force_contribution == "relative":
         force = relative_force_transform(force)
     target_score = force / jnp.asarray(kbT, dtype=x.dtype)
-    squared_error = jnp.square(score - target_score).reshape((x.shape[0], -1))
+    residual = score - target_score
+    if bond_pairs is not None:
+        # TSM only constrains the non-stretch directions; bond stretches are left to DSM.
+        residual = project_out_bond_stretches(residual, x, bond_pairs)
+    squared_error = jnp.square(residual).reshape((x.shape[0], -1))
     loss_per_sample = jnp.mean(squared_error, axis=-1)
     time_weights = _as_batch_weights(time_weighting(t), x.shape[0], x.dtype, "time_weighting(t)")
 

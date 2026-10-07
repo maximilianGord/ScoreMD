@@ -84,6 +84,8 @@ def get_loss(
     tsm_sigma_max: float = 0.01,
     tsm_force_contribution: str = "absolute",
     tsm_lambda_scheme: str = "uniform",
+    tsm_project_bonds: bool = False,
+    bond_pairs: Optional[ArrayLike] = None,
     sg_type: str = "constant",
     sg_lambda: float = 1.0,
     sg_t0: float = 0.05,
@@ -151,9 +153,14 @@ def get_loss(
         raise ValueError(f"Unknown tsm_type={tsm_type!r}.")
     if tsm_force_contribution not in ("absolute", "relative"):
         raise ValueError("tsm_force_contribution must be 'absolute' or 'relative'.")
+    if tsm_project_bonds and loss_type != "tsm":
+        raise ValueError("tsm_project_bonds is only implemented for loss_type='tsm'.")
+    tsm_bond_pairs = bond_pairs if tsm_project_bonds else None
+    if tsm_project_bonds and bond_pairs is None:
+        raise ValueError("tsm_project_bonds=True requires the dataset's bond_pairs (set at runtime by train.py).")
     if loss_type == "sc" and sg_type not in valid_matching_types:
         raise ValueError(f"Unknown sg_type={sg_type!r}.")
-    valid_lambda_schemes = ("song", "dsm_optimal", "tsm_optimal", "uniform")
+    valid_lambda_schemes = ("song", "dsm_optimal", "tsm_optimal", "uniform", "sigma_sq")
     if tsm_type == "mode_mixture" and tsm_lambda_scheme not in valid_lambda_schemes:
         raise ValueError(f"Unknown tsm_lambda_scheme={tsm_lambda_scheme!r}.")
     if sg_type == "mode_mixture" and sg_lambda_scheme not in valid_lambda_schemes:
@@ -396,6 +403,7 @@ def get_loss(
                     sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     lambda_scheme=tsm_lambda_scheme,
+                    bond_pairs=tsm_bond_pairs,
                     reduce=reduce_op,
                 )
                 #combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
@@ -422,6 +430,7 @@ def get_loss(
                     sigma_mode_sq=effective_sigma_mode_sq,
                     kbT=kbT,
                     reduce=reduce_op,
+                    bond_pairs=tsm_bond_pairs,
                 )
                 #combined_per_sample = losses + target_score_losses
                 diffusion_loss = reduce_op(losses)

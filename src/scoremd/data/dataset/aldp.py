@@ -197,6 +197,16 @@ class ALDPDataset(Dataset):
         elif datapoints is self._val:
             self._val_force_coordinates = None
 
+    def bond_pairs(self) -> onp.ndarray:
+        """Covalent bonds between the kept atoms, as (n_bonds, 2) indices into the kept-atom ordering."""
+        index = {atom: k for k, atom in enumerate(self._atoms_to_keep)}
+        pairs = [
+            (index[b[0].index], index[b[1].index])
+            for b in self._dataset.system.mdtraj_topology.bonds
+            if b[0].index in index and b[1].index in index
+        ]
+        return onp.asarray(pairs, dtype=onp.int32)
+
     def project_forces(self, full_forces: jnp.ndarray) -> jnp.ndarray:
         """Project 22-atom OpenMM forces onto the atoms represented by this dataset."""
         full_forces = jnp.asarray(full_forces).reshape((-1, 3))

@@ -81,7 +81,7 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     if datapoints is None or datapoints.forces is not None:
         return datapoints
     if not hasattr(dataset, "force") or not callable(dataset.force):
-        raise TypeError("loss_type='tsm' or 'sc' requires a dataset with a callable force(frame) method.")
+        raise TypeError("loss_type='tsm', 'sc' or 'fm' requires a dataset with a callable force(frame) method.")
 
     sample_shape = tuple(dataset.sample_shape)
     if datapoints.data.shape[1] != int(np.prod(sample_shape)):
@@ -153,7 +153,7 @@ def _prepare_tsm_inputs(
     force_losses = [
         loss
         for loss in training_schedule.losses
-        if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc")
+        if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc", "fm")
     ]
     if not force_losses:
         return train_data, val_data

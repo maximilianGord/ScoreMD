@@ -233,7 +233,9 @@ def tsm_loss(
 
     if tsm_force_contribution == "relative":
         force = relative_force_transform(force)
-    target_score = force / jnp.asarray(kbT, dtype=x.dtype)
+    # For x_t = alpha_t x_0 + sigma_t eps: grad log p_t(x_t) = E[grad log p_0(x_0) | x_t] / alpha_t.
+    alpha_t = jnp.exp(sde.log_mean_coeff(t)).astype(x.dtype)
+    target_score = batch_mul(1.0 / alpha_t, force / jnp.asarray(kbT, dtype=x.dtype))
     residual = score - target_score
     if bond_pairs is not None:
         # TSM only constrains the non-stretch directions; bond stretches are left to DSM.

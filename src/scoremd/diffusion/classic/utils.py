@@ -106,6 +106,7 @@ def get_loss(
     lambda_scheme: str = "uniform",
     kbT: float = 1.0,
     delta_s: Optional[float] = None,
+    fm_t: float = 1e-5,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -134,6 +135,9 @@ def get_loss(
       sc_frontier_warmup: Fraction of training after which the frontier reaches t = 1.
       sc_frontier_power: Shape of the frontier's motion, progress ** power (>1 lingers near the TSM regime).
       sc_frontier_tsm_share: For 'bias_frontier', the fraction of biased draws kept in the TSM regime.
+      fm_t: For loss_type='fm' (pure force matching, no diffusion), the fixed time at which the model is
+        evaluated on the clean data. The loss is |s(x, fm_t) - F(x)/kbT|^2; the sampled ts are ignored.
+        Choose it equal to evaluation.eval_t so Langevin simulates the force that was trained.
 
     The returned loss function also accepts a keyword-only
     ``sigma_mode_sq_per_sample`` argument (a per-batch-sample array, sliced
@@ -146,8 +150,10 @@ def get_loss(
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
     """
-    if loss_type not in ("dsm", "tsm", "sc"):
-        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', or 'sc'.")
+    if loss_type not in ("dsm", "tsm", "sc", "fm"):
+        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', 'sc', or 'fm'.")
+    if loss_type == "fm" and (alpha > 1e-6 or beta > 1e-6):
+        raise ValueError("loss_type='fm' is pure force matching; set alpha=0 and beta=0 (no FP term).")
     valid_matching_types = ("constant", "hard_cutoff", "smooth_decay", "linear", "linear_decay", "noise_cutoff", "mode_mixture")
     if loss_type == "tsm" and tsm_type not in valid_matching_types:
         raise ValueError(f"Unknown tsm_type={tsm_type!r}.")
@@ -224,6 +230,33 @@ def get_loss(
         rng, error_rng, dropout_rng = jax.random.split(rng, 3)
         score_fn = get_score(model, params, training, evaluated_models, rngs={"dropout": dropout_rng})
         teacher_score_fn = get_score(model, teacher_params, False, evaluated_models)
+
+        if loss_type == "fm":
+            # Pure force matching: regress the model's score at the clean data (fixed t = fm_t) onto F/kbT.
+            # No noise, no DSM; reported in the TSM slot so logging and plots stay unchanged.
+            if forces is None:
+                raise ValueError("loss_type='fm' requires precomputed per-sample forces.")
+            positions = batch if force_batch is None else force_batch
+            t_fm = jnp.full_like(ts, fm_t)
+            fm_losses, _, _ = tsm_loss(
+                error_rng,
+                sde,
+                score_fn(positions, features, t_fm),
+                positions,
+                forces,
+                features,
+                t_fm,
+                lambda t: jnp.ones_like(t),
+                "constant",
+                1.0,
+                tsm_t0,
+                tsm_sigma_max,
+                tsm_force_contribution="absolute",
+                kbT=kbT,
+                reduce=reduce_op,
+            )
+            zero = jnp.zeros((), dtype=batch.dtype)
+            return zero, zero, zero, reduce_op(fm_losses), zero
 
         perturbed_data, perturbed_noise, std = perturb(ts, sde, error_rng, batch)
 

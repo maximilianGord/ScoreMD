@@ -108,6 +108,7 @@ class TrainingSchedule(abc.ABC):
         sigma_mode_sq: Optional[ArrayLike] = None,
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
+        tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         """Use this train step when you have no clue about the ordering of t and it could be that each loss function needs to be called on it."""
 
@@ -124,6 +125,7 @@ class TrainingSchedule(abc.ABC):
             sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
             force_batch: Optional[ArrayLike] = None,
             progress: Optional[ArrayLike] = None,
+            tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
         ) -> Tuple[ArrayLike, ArrayLike]:
             # `_train_step_single_loss` always calls its `loss_fn` with a
             # `sigma_mode_sq_per_sample` kwarg; accepted here for call
@@ -148,6 +150,7 @@ class TrainingSchedule(abc.ABC):
                         sigma_mode_sq_per_sample=sigma_mode_sq,
                         force_batch=force_batch,
                         progress=progress,
+                        tsm_sample=tsm_sample,
                     ),
                     lambda: (jnp.sum(jnp.zeros(5)), jnp.zeros(5)),
                 )
@@ -169,6 +172,7 @@ class TrainingSchedule(abc.ABC):
             sigma_mode_sq,
             force_batch=force_batch,
             progress=progress,
+            tsm_sample=tsm_sample,
         )
 
     @staticmethod
@@ -185,6 +189,7 @@ class TrainingSchedule(abc.ABC):
         sigma_mode_sq: Optional[ArrayLike] = None,
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
+        tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
             _, loss = loss_fn(
@@ -200,6 +205,7 @@ class TrainingSchedule(abc.ABC):
                 sigma_mode_sq_per_sample=sigma_mode_sq,
                 force_batch=force_batch,
                 progress=progress,
+                tsm_sample=tsm_sample,
             )
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
@@ -215,6 +221,7 @@ class TrainingSchedule(abc.ABC):
             sigma_mode_sq_per_sample=sigma_mode_sq,
             force_batch=force_batch,
             progress=progress,
+            tsm_sample=tsm_sample,
         )
 
         state = state.apply_gradients(grads=grads)
@@ -264,6 +271,15 @@ class TrainingSchedule(abc.ABC):
             current_sigma_mode_sq = (
                 datapoints.sigma_mode_sq[perm, ...] if datapoints.sigma_mode_sq is not None else None
             )
+            current_tsm_t, current_tsm_noise = None, None
+            if datapoints.tsm_t is not None:
+                # Precomputed TSM bank: one of the M stored (t, noise, force) draws per sample; its force replaces
+                # the per-frame force, and is rotated with the data below like the forces.
+                key, draw_key = jax.random.split(key)
+                draw = jax.random.randint(draw_key, perm.shape, 0, datapoints.tsm_t.shape[1])
+                current_tsm_t = datapoints.tsm_t[perm, draw]
+                current_tsm_noise = datapoints.tsm_noise[perm, draw]
+                current_forces = datapoints.tsm_forces[perm, draw]
             if data_sharding is not None:
                 current_data = jax.lax.with_sharding_constraint(current_data, data_sharding)
                 if current_features is not None:
@@ -289,6 +305,14 @@ class TrainingSchedule(abc.ABC):
             current_data *= norm_factor
             if current_forces is not None:
                 current_forces /= norm_factor
+            tsm_sample = None
+            if current_tsm_t is not None:
+                # the noise is already in normalized coordinates; rotate it with the same matrices as the data
+                if self.augment is apply_random_rotations:
+                    current_tsm_noise = apply_random_rotations_to_vectors(current_tsm_noise, augment_key)
+                elif self.augment is not IDENTITY:
+                    raise ValueError("A precomputed TSM bank supports only no augmentation or random rotations.")
+                tsm_sample = (current_tsm_t, current_tsm_noise)
 
             cur_losses = []
             for ts, possible_loss in sample_ts(iter_key):
@@ -309,6 +333,7 @@ class TrainingSchedule(abc.ABC):
                         current_sigma_mode_sq,
                         force_batch=current_force_data,
                         progress=progress,
+                        tsm_sample=tsm_sample,
                     )
                 else:
                     state, cur_loss = self._mixed_t_train_step(
@@ -324,6 +349,7 @@ class TrainingSchedule(abc.ABC):
                         current_sigma_mode_sq,
                         force_batch=current_force_data,
                         progress=progress,
+                        tsm_sample=tsm_sample,
                     )
                 cur_losses.append(cur_loss)
 

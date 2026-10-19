@@ -2,7 +2,7 @@
 Taken from https://github.com/bb515/diffusionjax/blob/24fb2c8ee0ca85f618caf797c24614d2ee686be4/diffusionjax/utils.py
 """
 
-from typing import Callable, Optional, Sequence, Any
+from typing import Callable, Optional, Sequence, Any, Tuple
 import jax
 import jax.numpy as jnp
 from jax.lax import scan
@@ -107,6 +107,9 @@ def get_loss(
     kbT: float = 1.0,
     delta_s: Optional[float] = None,
     fm_t: float = 1e-5,
+    tsm_mean_force_bank: Optional[str] = None,
+    tsm_bank_target: str = "mean_force",
+    tsm_bank_weight: float = 1.0,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -135,6 +138,14 @@ def get_loss(
       sc_frontier_warmup: Fraction of training after which the frontier reaches t = 1.
       sc_frontier_power: Shape of the frontier's motion, progress ** power (>1 lingers near the TSM regime).
       sc_frontier_tsm_share: For 'bias_frontier', the fraction of biased draws kept in the TSM regime.
+      tsm_mean_force_bank: For loss_type='tsm', or loss_type='sc' with sc_switch=True, path to a bank from
+        precompute_tsm_mean_force.py. train.py attaches it to the training data; the force term (the TSM term, or the
+        anchor for sigma_t <= force_sigma_max of the sc switch) then uses the bank's noisy samples (t, eps) and force
+        targets instead of the DSM sample and the per-frame force. Not used inside this function.
+      tsm_bank_target: Which bank force is the target: 'mean_force' (posterior mean E[F(x0) | x_t]) or 'force_x0'
+        (the per-frame force on the same noisy samples, as control).
+      tsm_bank_weight: Set by train.py to the fraction of training times inside the bank's TSM window, so the
+        TSM term keeps the weight it has with ts ~ U(range).
       fm_t: For loss_type='fm' (pure force matching, no diffusion), the fixed time at which the model is
         evaluated on the clean data. The loss is |s(x, fm_t) - F(x)/kbT|^2; the sampled ts are ignored.
         Choose it equal to evaluation.eval_t so Langevin simulates the force that was trained.
@@ -222,6 +233,7 @@ def get_loss(
         sigma_mode_sq_per_sample: Optional[ArrayLike] = None,
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
+        tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
     ) -> Sequence[ArrayLike]:
         # Per-sample sigma_mode_sq (e.g. mode_var_computation="gmm_per_sample") overrides
         # the scalar `sigma_mode_sq` config value when supplied by the caller; otherwise
@@ -414,6 +426,23 @@ def get_loss(
             force_perturbed_data, _, _ = perturb(ts, sde, force_rng, force_batch)
             force_score = score_fn(force_perturbed_data, features, ts)
 
+        # Precomputed TSM bank (tsm_mean_force_bank): the force term (TSM, or the anchor of the sc switch) uses the
+        # stored noisy sample x_t = alpha_t x0 + sigma_t eps with its own (t, eps) and the stored force target
+        # (``forces``, e.g. the posterior mean force E[F(x0) | x_t]) instead of the DSM sample with F(x0).
+        tsm_ts = ts
+        if tsm_sample is not None:
+            bank_tsm = loss_type == "tsm" and tsm_type != "mode_mixture"
+            bank_sc = loss_type == "sc" and sc_switch and sg_type != "mode_mixture"
+            if not (bank_tsm or bank_sc) or force_batch is not None:
+                raise ValueError(
+                    "A precomputed TSM bank needs loss_type='tsm' (non-mode_mixture tsm_type) or loss_type='sc' with "
+                    "sc_switch=True (non-mode_mixture sg_type), and no force_batch."
+                )
+            tsm_ts, tsm_noise = tsm_sample
+            tsm_mean, tsm_std = sde.marginal_prob(batch, tsm_ts)
+            force_perturbed_data = tsm_mean + batch_mul(tsm_std, tsm_noise)
+            force_score = score_fn(force_perturbed_data, features, tsm_ts)
+
         if loss_type == "tsm":
             if forces is None:
                 raise ValueError("loss_type='tsm' requires precomputed per-sample forces.")
@@ -452,7 +481,7 @@ def get_loss(
                     force_perturbed_data,
                     forces,
                     features,
-                    ts,
+                    tsm_ts,
                     time_weighting,
                     tsm_type,
                     tsm_lambda,
@@ -465,6 +494,10 @@ def get_loss(
                     reduce=reduce_op,
                     bond_pairs=tsm_bond_pairs,
                 )
+                if tsm_sample is not None:
+                    # every bank sample lies in the TSM window, while with ts ~ U(range) only a fraction
+                    # tsm_bank_weight of the samples does: rescale so the TSM term keeps its weight in the loss
+                    target_score_losses = target_score_losses * tsm_bank_weight
                 #combined_per_sample = losses + target_score_losses
                 diffusion_loss = reduce_op(losses)
                 tsm_component = reduce_op(target_score_losses)
@@ -590,7 +623,7 @@ def get_loss(
                     force_perturbed_data,
                     forces,
                     features,
-                    ts,
+                    tsm_ts,
                     time_weighting,
                     "constant",
                     sg_lambda,
@@ -620,7 +653,13 @@ def get_loss(
                     reduce=reduce_op,
                 )
                 is_anchor = std <= force_sigma_max
-                combined_per_sample = jnp.where(is_anchor, anchor_losses, sc_per_sample)
+                if tsm_sample is None:
+                    combined_per_sample = jnp.where(is_anchor, anchor_losses, sc_per_sample)
+                else:
+                    # bank: the semigroup term keeps the samples above the switch, the anchor comes from the bank
+                    # samples (all inside sigma <= force_sigma_max), rescaled by the fraction tsm_bank_weight of
+                    # training times inside the window, so both keep their weight in expectation
+                    combined_per_sample = jnp.where(is_anchor, 0.0, sc_per_sample) + anchor_losses * tsm_bank_weight
                 sc_loss = reduce_op(combined_per_sample)
 
             elif sg_type == "mode_mixture":

@@ -4,6 +4,7 @@ from scoremd.utils.file import (
     get_persistent_storage,
 )  # this should be the very first line so that the .env file is loaded
 import hashlib
+import json
 import logging
 import os
 import functools
@@ -142,6 +143,67 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     return datapoints.replace(forces=jnp.asarray(forces))
 
 
+def _attach_tsm_bank(train_data: Datapoints, force_losses) -> Datapoints:
+    """Attach a precomputed TSM bank (precompute_tsm_mean_force.py) to the training data, if a loss names one.
+
+    The bank stores, per training frame, M noisy samples (t, eps) in the TSM window and their force targets; the force
+    term then uses those instead of the DSM sample and the per-frame force (see get_loss, tsm_mean_force_bank). The
+    force term is the TSM term (loss_type='tsm', tsm_type='noise_cutoff', window tsm_sigma_max) or the force anchor
+    of the sc switch (loss_type='sc', sc_switch=True, window force_sigma_max; the semigroup term above it needs no
+    force targets).
+    """
+    banks = [loss for loss in force_losses if _loss_options(loss).get("tsm_mean_force_bank")]
+    if not banks:
+        return train_data
+    if len(banks) > 1 or len(force_losses) > 1:
+        raise ValueError("tsm_mean_force_bank supports a single force loss.")
+    ranged_loss = banks[0]
+    options = _loss_options(ranged_loss)
+    loss_type = options.get("loss_type")
+    if loss_type == "tsm" and options.get("tsm_type") == "noise_cutoff":
+        window_key, window = "tsm_sigma_max", options.get("tsm_sigma_max", 0.01)
+    elif loss_type == "sc" and options.get("sc_switch", False) and options.get("sg_type") != "mode_mixture":
+        window_key, window = "force_sigma_max", options.get("force_sigma_max", 0.01)
+    else:
+        raise ValueError("tsm_mean_force_bank requires loss_type='tsm' with tsm_type='noise_cutoff', or loss_type='sc' "
+                         "with sc_switch=True and a non-mode_mixture sg_type.")
+    path = options["tsm_mean_force_bank"]
+    bank = np.load(path)
+    meta = json.loads(str(bank["meta"]))
+    # Same frames in the same order? The bank's per-frame forces F(x0) must match this run's precomputed forces
+    # (a hash of the frames is not enough: CPU and GPU give frames that differ by ~1e-6 nm after alignment).
+    if meta["frames"] != train_data.data.shape[0]:
+        raise ValueError(f"{path} has {meta['frames']} frames, this run has {train_data.data.shape[0]}.")
+    f_run, f_bank = np.asarray(train_data.forces, dtype=np.float64), np.asarray(bank["force_x0"], dtype=np.float64)
+    mismatch = np.sqrt(np.mean((f_run - f_bank) ** 2) / np.mean(f_run**2))
+    if not mismatch < 1e-3:
+        raise ValueError(f"{path} was computed for other training frames: relative rms difference of the per-frame "
+                         f"forces {mismatch:.2e} (expected < 1e-3).")
+    if not np.isclose(meta["sigma_max"], window):
+        raise ValueError(f"bank sigma_max={meta['sigma_max']} differs from {window_key}={window}; precompute a bank "
+                         f"with precompute_tsm_mean_force.py --sigma-max {window}.")
+    target = options.get("tsm_bank_target", "mean_force")
+    if target == "mean_force":
+        tsm_forces = bank["mean_force"]
+    elif target == "force_x0":
+        tsm_forces = np.repeat(bank["force_x0"][:, None], bank["t"].shape[1], axis=1)
+    else:
+        raise ValueError(f"Unknown tsm_bank_target={target!r}; use 'mean_force' or 'force_x0'.")
+    # fraction of training times ts ~ U(range) that fall into the bank's TSM window
+    t1, t0 = ranged_loss.range
+    weight = (meta["t_max"] - meta["t_min"]) / (t1 - t0)
+    _set_runtime_loss_options(ranged_loss, tsm_bank_weight=float(weight))
+    log.info(
+        "TSM bank %s: %d frames x %d draws, sigma <= %g (t in [%g, %.5f]), target %s, TSM weight x %.4f",
+        path, meta["frames"], bank["t"].shape[1], meta["sigma_max"], meta["t_min"], meta["t_max"], target, weight,
+    )
+    return train_data.replace(
+        tsm_t=jnp.asarray(bank["t"], dtype=jnp.float32),
+        tsm_noise=jnp.asarray(bank["noise"], dtype=jnp.float32),
+        tsm_forces=jnp.asarray(tsm_forces, dtype=jnp.float32),
+    )
+
+
 def _prepare_tsm_inputs(
     dataset: Dataset,
     training_schedule,
@@ -260,6 +322,7 @@ def _prepare_tsm_inputs(
 
     train_data = _precompute_forces(dataset, train_data)
     val_data = _precompute_forces(dataset, val_data)
+    train_data = _attach_tsm_bank(train_data, force_losses)
     for ranged_loss in force_losses:
         _set_runtime_loss_options(ranged_loss, kbT=float(dataset.kbT))
         if _loss_options(ranged_loss).get("tsm_project_bonds", False):
@@ -288,6 +351,7 @@ def training_routine(
     no_evaluation: bool,
     seed: int,
     wandb: dict,
+    out_subdir: str = "out",
 ):
     assert len(ranged_models) > 0, "At least one model is required"
     assert continue_from is None or load_dir is None, "Please specify either load_dir or continue_from, not both."
@@ -316,7 +380,7 @@ def training_routine(
             )
             model_load_dir = None
 
-    out_dir = os.path.join(base_dir, "out")
+    out_dir = os.path.join(base_dir, out_subdir)
     os.makedirs(out_dir, exist_ok=True)
 
     log.info(
@@ -544,6 +608,7 @@ if __name__ == "__main__":
         evaluation=builds(EvaluationSettings, populate_full_signature=True),
         seed=1,
         wandb={"enabled": False, "project": "scoremd"},
+        out_subdir="out",
         zen_meta={"model": None},
         populate_full_signature=True,
         hydra_defaults=[

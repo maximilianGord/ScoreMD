@@ -14,9 +14,30 @@ from tqdm import tqdm
 import numpy as onp
 from scoremd.simulation import simulate
 from scoremd.utils.plots import plot_fes_angles
+from scoremd.evaluate.structure import key_angle_summary, plot_bond_density, structure_summary
+
+# Free-energy plot settings: 400-point grid, Gaussian filter against sampling-noise jaggedness (phi 0.1 rad,
+# psi 0.15 rad), plus a stronger 0.25 rad filter only above 20 (phi) / 15 (psi) against spikes in sparse regions;
+# psi: values above 20 compressed smoothly (c + w tanh((F - c) / w)), staying below 24;
+# phi: unchanged up to 40, above it compressed logarithmically (40 + 2 log(1 + (F - 40) / 2)), staying below 48.
+FES_PHI = dict(n_grid=400, fes_smooth_sigma=0.1, smooth_above_fes=40, cap_mode="log", smooth_width=2.0, max_above=8.0,
+               high_fes_smooth_sigma=0.25, high_fes_from=20.0)
+FES_PSI = dict(n_grid=400, fes_smooth_sigma=0.15, smooth_above_fes=20, smooth_width=4,
+               high_fes_smooth_sigma=0.25, high_fes_from=15.0)
 import gc
 
 log = logging.getLogger(__name__)
+
+
+def _structure_metrics(dataset, target, sampled, out_path: str, title: str, key_prefix: str) -> dict:
+    """Pooled bond-length / bond-angle summary plot; never lets a plotting problem break the evaluation."""
+    try:
+        metrics = structure_summary(dataset, target, sampled, out_path, title)
+        metrics |= key_angle_summary(dataset, target, sampled, out_path.replace("_structure.png", "_key_angles.png"), title)
+        return {f"eval/{key_prefix}_{k}": v for k, v in metrics.items()}
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Structure summary failed: {e}")
+        return {}
 
 
 def evaluate_iid_samples(
@@ -39,8 +60,8 @@ def evaluate_iid_samples(
     sampled_phi, sampled_psi = dataset.get_2d_features(q_samples)
 
     plt.figure(clear=True)
-    plot_fes_angles(target_phi, dataset.kbT, label="Target", smooth_above_fes=45)
-    plot_fes_angles(sampled_phi, dataset.kbT, label="Sampled", linestyle="--", smooth_above_fes=45)
+    plot_fes_angles(target_phi, dataset.kbT, label="Target", **FES_PHI)
+    plot_fes_angles(sampled_phi, dataset.kbT, label="Sampled", linestyle="--", **FES_PHI)
     plt.xlabel(r"$\varphi$")
     plt.ylim(bottom=-5, top=50)
     plt.legend()
@@ -48,8 +69,8 @@ def evaluate_iid_samples(
     plt.close()
 
     plt.figure(clear=True)
-    plot_fes_angles(target_psi, dataset.kbT, label="Target", smooth_above_fes=25)
-    plot_fes_angles(sampled_psi, dataset.kbT, label="Sampled", linestyle="--", smooth_above_fes=25)
+    plot_fes_angles(target_psi, dataset.kbT, label="Target", **FES_PSI)
+    plot_fes_angles(sampled_psi, dataset.kbT, label="Sampled", linestyle="--", **FES_PSI)
     plt.xlabel(r"$\psi$")
     plt.ylim(top=25)
     plt.legend()
@@ -101,8 +122,11 @@ def evaluate_iid_samples(
     phi_psi_samples = jnp.stack([sampled_phi, sampled_psi], axis=1)
 
     rms_fe_sq_error, rms_mjs_error = phi_psi_metrics(target_phi, target_psi, sampled_phi, sampled_psi, n_bins=64)
+    structure_metrics = _structure_metrics(
+        dataset, ground_truth_samples, q_samples, f"{out_dir}/{prefix}_iid_structure.png", f"{prefix} (iid)", f"{prefix}_iid"
+    )
 
-    return {
+    return structure_metrics | {
         f"eval/{prefix}_iid_js_divergence": js_divergence(target_phi_psi, phi_psi_samples, bins=64),
         f"eval/{prefix}_iid_rms_fe_sq_error": rms_fe_sq_error,
         f"eval/{prefix}_iid_rms_mjs_error": rms_mjs_error,
@@ -251,8 +275,8 @@ def evaluate_langevin_samples(
         # now we plot the marginals
         plt.figure(clear=True)
         plt.title(f"$\\varphi$ Histogram {prefix} (simulated) {empty_if_none(i, f' - Trajectory {i}')}")
-        plot_fes_angles(target_phi, dataset.kbT, label="Target", smooth_above_fes=45)
-        plot_fes_angles(current_phi, dataset.kbT, label="Sampled", linestyle="--", smooth_above_fes=45)
+        plot_fes_angles(target_phi, dataset.kbT, label="Target", **FES_PHI)
+        plot_fes_angles(current_phi, dataset.kbT, label="Sampled", linestyle="--", **FES_PHI)
         plt.xlabel(r"$\varphi$")
         plt.ylim(bottom=-5, top=50)
         plt.legend()
@@ -271,8 +295,8 @@ def evaluate_langevin_samples(
         # now we do psi
         plt.figure(clear=True)
         plt.title(f"$\\psi$ Histogram {prefix} (simulated) {empty_if_none(i, f' - Trajectory {i}')}")
-        plot_fes_angles(target_psi, dataset.kbT, label="Target", smooth_above_fes=25)
-        plot_fes_angles(current_psi, dataset.kbT, label="Sampled", linestyle="--", smooth_above_fes=25)
+        plot_fes_angles(target_psi, dataset.kbT, label="Target", **FES_PSI)
+        plot_fes_angles(current_psi, dataset.kbT, label="Sampled", linestyle="--", **FES_PSI)
         plt.xlabel(r"$\psi$")
         plt.ylim(top=25)
         plt.legend()
@@ -320,7 +344,8 @@ def evaluate_langevin_samples(
             a0_name, a1_name = dataset.atom_names[a0], dataset.atom_names[a1]
             # plot the histogram of the distances
             plt.figure(clear=True)
-            plt.title(f"Histogram of distances between {a0_name} and {a1_name} {prefix} {i}")
+            which = "Langevin, all trajectories" if i is None else f"Langevin trajectory {i}"
+            plt.title(f"Histogram of distances between {a0_name} and {a1_name} ({prefix}, {which})")
             plt.hist(target_distances[:, a0, a1], bins=100, density=True, label="Target")
             plt.hist(distances[:, a0, a1], bins=100, density=True, label="Sampled", alpha=0.7)
             plt.xlim(target_distances[:, a0, a1].min(), target_distances[:, a0, a1].max())
@@ -345,6 +370,25 @@ def evaluate_langevin_samples(
         _plot_bond_lengths,
         desc="Plotting bond lengths",
         call_on_all=not isinstance(dataset, CGMinipeptideDataset),  # we might not have enough memory for this
+    )
+    # paper-style per-bond densities (all trajectories together, in Angstrom)
+    try:
+        all_distances = pairwise_distances(trajectories.reshape(-1, *dataset.sample_shape))
+        for a0, a1 in dataset.bonds:
+            plot_bond_density(
+                target_distances[:, a0, a1],
+                all_distances[:, a0, a1],
+                f"{dataset.atom_names[a0]}-{dataset.atom_names[a1]}",
+                f"{out_dir}/{prefix}_langevin_bond_density_{a0}_{a1}.png",
+                f"{prefix}, Langevin (all trajectories)",
+            )
+        del all_distances
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Bond density plots failed: {e}")
+
+    structure_metrics = _structure_metrics(
+        dataset, dataset.train.data, trajectories, f"{out_dir}/{prefix}_langevin_structure.png",
+        f"{prefix} (Langevin)", f"{prefix}_langevin",
     )
 
     if hasattr(dataset, "coarse_graining_level") and dataset.coarse_graining_level == CoarseGrainingLevel.NONE:
@@ -411,7 +455,7 @@ def evaluate_langevin_samples(
         target_phi, target_psi, sampled_phi_psi[:, 0], sampled_phi_psi[:, 1], n_bins=64
     )
 
-    return {
+    return structure_metrics | {
         f"eval/{prefix}_langevin_js_divergence": js_divergence(target_phi_psi, sampled_phi_psi, bins=64),
         f"eval/{prefix}_langevin_rms_fe_sq_error": rms_fe_sq_error,
         f"eval/{prefix}_langevin_rms_mjs_error": rms_mjs_error,

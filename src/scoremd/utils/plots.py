@@ -125,6 +125,23 @@ def phi_psi(phi, psi, title="Histogram", highlight=None, bins=60, vmin=None, vma
     return phi, psi
 
 
+def _gaussian_smooth(values, dx: float, sigma: float, periodic: bool):
+    """Gaussian filter of a curve on a uniform grid (sigma in x units); wraps around if periodic."""
+    import numpy as onp
+
+    values = onp.asarray(values)
+    half = max(1, int(onp.ceil(3 * sigma / dx)))
+    kernel = onp.exp(-0.5 * (onp.arange(-half, half + 1) * dx / sigma) ** 2)
+    kernel /= kernel.sum()
+    if periodic:  # grid includes both endpoints of the period; filter the unique points and re-close it
+        core = values[:-1]
+        padded = onp.concatenate([core[-half:], core, core[:half]])
+        smoothed = onp.convolve(padded, kernel, mode="valid")
+        return jnp.asarray(onp.append(smoothed, smoothed[0]))
+    padded = onp.pad(values, half, mode="edge")
+    return jnp.asarray(onp.convolve(padded, kernel, mode="valid"))
+
+
 def plot_fes(
     samples: jnp.ndarray,
     kBT: float,
@@ -133,10 +150,33 @@ def plot_fes(
     bw_method: float = 0.05,
     linewidth: float = 3,
     smooth_above_fes: Optional[float] = None,
-    cap_slope: float = 0.01,
+    smooth_width: float = 4.0,
+    fes_smooth_sigma: Optional[float] = None,
+    periodic: bool = False,
+    cap_mode: str = "tanh",
+    max_above: float = 9.0,
+    high_fes_smooth_sigma: Optional[float] = None,
+    high_fes_from: Optional[float] = None,
+    high_fes_blend: float = 5.0,
+    post_cap_smooth_sigma: Optional[float] = None,
     *args,
     **kwargs,
 ):
+    """Plot the free energy -kBT log p of ``samples`` estimated with a Gaussian KDE.
+
+    smooth_above_fes: values above it are compressed smoothly as c + w tanh((F - c) / w), with c the
+        threshold and w = ``smooth_width``. The curve keeps slope 1 at c (no kink) and never exceeds c + w.
+    high_fes_smooth_sigma / high_fes_from / high_fes_blend: optional extra Gaussian filter (sigma in x units) applied
+        only where the curve is above high_fes_from, blended in smoothly over the next high_fes_blend units; removes
+        the spikes few samples create in sparsely sampled regions and leaves everything below the threshold unchanged.
+    fes_smooth_sigma: optional Gaussian filter of the free-energy curve (in x units, e.g. rad) that removes
+        the sampling-noise jaggedness in sparsely sampled regions; applied before the compression.
+    cap_mode: "tanh" (soft compression described above), "clip" (hard cut at ``smooth_above_fes``) or
+        "softmin" (cut at ``smooth_above_fes`` with corners rounded over ~``smooth_width``) or "log"
+        (logarithmic compression above the threshold, bounded below ``smooth_above_fes + max_above``).
+    post_cap_smooth_sigma: optional Gaussian filter applied after the cap, which rounds the corners where
+        the curve meets the cap (purely visual; used with cap_mode="clip").
+    """
     if grid is None:
         grid = jnp.linspace(samples.min(), samples.max(), 100)
 
@@ -151,14 +191,47 @@ def plot_fes(
     density = gaussian_kde(samples, bw_method, weights).pdf(grid)
     fes = -kBT * jnp.log(jnp.clip(density, a_min=jnp.finfo(density.dtype).tiny))
 
+    if fes_smooth_sigma is not None:
+        fes = _gaussian_smooth(fes, float(grid[1] - grid[0]), fes_smooth_sigma, periodic)
+
     fes -= fes.min()
 
+    if high_fes_smooth_sigma is not None and high_fes_from is not None:
+        strong = _gaussian_smooth(fes, float(grid[1] - grid[0]), high_fes_smooth_sigma, periodic)
+        u = jnp.clip((jnp.minimum(fes, strong) - high_fes_from) / high_fes_blend, 0.0, 1.0)
+        weight = u * u * (3.0 - 2.0 * u)  # smoothstep: no kink where the blending starts or ends
+        fes = (1.0 - weight) * fes + weight * strong
+
     if smooth_above_fes is not None:
-        # points at/below the threshold are untouched; above it, keep rising but at
-        # cap_slope of the real slope instead of jumping straight to a distant anchor
-        # point (as a bridge/interpolation would) or flattening outright.
-        excess = jnp.clip(fes - smooth_above_fes, a_min=0.0)
-        fes = jnp.where(fes > smooth_above_fes, smooth_above_fes + cap_slope * excess, fes)
+        if cap_mode == "clip":
+            fes = jnp.minimum(fes, smooth_above_fes)
+        elif cap_mode == "log":
+            # unchanged up to the threshold, above it c + w log(1 + (F - c) / w): slope 1 at c, keeps rising slowly
+            # (rounded tops instead of flat plateaus); a final tanh bound keeps it below c + max_above
+            excess = jnp.clip(fes - smooth_above_fes, a_min=0.0)
+            compressed = smooth_width * jnp.log1p(excess / smooth_width)
+            compressed = max_above * jnp.tanh(compressed / max_above)
+            fes = jnp.where(fes > smooth_above_fes, smooth_above_fes + compressed, fes)
+        elif cap_mode == "softmin":
+            # smooth minimum of F and the cap: equals the cap on plateaus, follows F well below it (error
+            # k * exp(-(cap - F) / k)), rounded corners in between; k = smooth_width
+            k = smooth_width
+            fes = -k * jnp.logaddexp(-fes / k, -smooth_above_fes / k)
+        elif cap_mode == "tanh":
+            excess = jnp.clip(fes - smooth_above_fes, a_min=0.0)
+            fes = jnp.where(fes > smooth_above_fes, smooth_above_fes + smooth_width * jnp.tanh(excess / smooth_width), fes)
+        else:
+            raise ValueError(f"Unknown cap_mode={cap_mode!r}; use 'tanh', 'clip', 'softmin' or 'log'.")
+
+    if post_cap_smooth_sigma is not None:
+        # Round the corners only around the capped stretches: the weight is the capped-region mask blurred along x,
+        # so it varies smoothly in x and is ~0 a few sigma away from the cap (basins keep their computed values).
+        dx = float(grid[1] - grid[0])
+        smoothed = _gaussian_smooth(fes, dx, post_cap_smooth_sigma, periodic)
+        top = smooth_above_fes if smooth_above_fes is not None else float(fes.max())
+        capped = (fes >= top - 1e-6).astype(fes.dtype)
+        weight = jnp.clip(2.0 * _gaussian_smooth(capped, dx, post_cap_smooth_sigma, periodic), 0.0, 1.0)
+        fes = (1.0 - weight) * fes + weight * smoothed
 
     plt.plot(grid, fes, linewidth=linewidth, *args, **kwargs)
     plt.xlim(grid.min(), grid.max())
@@ -168,13 +241,19 @@ def plot_fes(
 
 
 def plot_fes_angles(
-    angles: jnp.ndarray, kBT: float, weights: Optional[jnp.ndarray] = None, bw_method: float = 0.05, *args, **kwargs
+    angles: jnp.ndarray,
+    kBT: float,
+    weights: Optional[jnp.ndarray] = None,
+    bw_method: float = 0.05,
+    n_grid: int = 100,
+    *args,
+    **kwargs,
 ):
-    grid = jnp.linspace(-jnp.pi, jnp.pi, 100)
+    grid = jnp.linspace(-jnp.pi, jnp.pi, n_grid)
     # we add the periodic boundary conditions so that the plot is continuous
     extended_angles = jnp.concatenate([angles, angles + 2 * jnp.pi, angles - 2 * jnp.pi])
     # extended_angles = angles
-    grid, fes = plot_fes(extended_angles, kBT, grid, weights, bw_method, *args, **kwargs)
+    grid, fes = plot_fes(extended_angles, kBT, grid, weights, bw_method, *args, periodic=True, **kwargs)
     plt.xticks(
         [-jnp.pi, -jnp.pi / 2, 0, jnp.pi / 2, jnp.pi],
         [r"$-\pi$", r"$-\frac{\pi}{2}$", "0", r"$\frac{\pi}{2}$", r"$\pi$"],

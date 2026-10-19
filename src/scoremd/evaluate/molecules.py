@@ -182,13 +182,15 @@ def evaluate_langevin_samples(
     prefix: str,
     out_dir: str,
     only_store_results: bool = False,
+    save_trajectories: bool = True,
 ) -> dict:
     # store the trajectories and velocities
-    onp.save(f"{out_dir}/{prefix}_langevin_trajectories.npy", trajectories)
-    onp.save(f"{out_dir}/{prefix}_langevin_velocities.npy", velocities)
-    log.info(
-        f"Saved langevin trajectories and velocities to {out_dir}/{prefix}_langevin_trajectories.npy and {out_dir}/{prefix}_langevin_velocities.npy"
-    )
+    if save_trajectories:
+        onp.save(f"{out_dir}/{prefix}_langevin_trajectories.npy", trajectories)
+        onp.save(f"{out_dir}/{prefix}_langevin_velocities.npy", velocities)
+        log.info(
+            f"Saved langevin trajectories and velocities to {out_dir}/{prefix}_langevin_trajectories.npy and {out_dir}/{prefix}_langevin_velocities.npy"
+        )
 
     if only_store_results:
         return {}
@@ -221,12 +223,13 @@ def evaluate_langevin_samples(
 
     base_frame = trajectories[0, 0]
 
-    @jax.vmap
+    @jax.jit
     def align_trajectory(trajectory):
         return kabsch_align_many(trajectory, base_frame)[0]
 
-    # align each trajectory to the base frame
-    trajectories = align_trajectory(trajectories)
+    # align each trajectory to the base frame, one at a time and kept on the host: aligning all
+    # trajectories at once runs out of GPU memory for long simulations (e.g. 100 x 120k frames)
+    trajectories = onp.stack([onp.asarray(align_trajectory(t)) for t in trajectories])
 
     def _plot_2d_histogram(trajectories: jnp.ndarray, i: Optional[int]):
         # plot the phi psi histogram of all trajectories individually and together
@@ -314,15 +317,17 @@ def evaluate_langevin_samples(
     target_distances = pairwise_distances(dataset.train.data)
 
     def _plot_bond_lengths(trajectories: jnp.ndarray, i: Optional[int]):
-        distances = pairwise_distances(trajectories)
+        # only the bonded pairs: all pairwise distances of every frame do not fit in memory for long simulations
+        positions = onp.asarray(trajectories).reshape(trajectories.shape[0], -1, 3)
 
         for a0, a1 in dataset.bonds:
             a0_name, a1_name = dataset.atom_names[a0], dataset.atom_names[a1]
+            bond_lengths = onp.linalg.norm(positions[:, a0] - positions[:, a1], axis=-1)
             # plot the histogram of the distances
             plt.figure(clear=True)
             plt.title(f"Histogram of distances between {a0_name} and {a1_name} {prefix} {i}")
             plt.hist(target_distances[:, a0, a1], bins=100, density=True, label="Target")
-            plt.hist(distances[:, a0, a1], bins=100, density=True, label="Sampled", alpha=0.7)
+            plt.hist(bond_lengths, bins=100, density=True, label="Sampled", alpha=0.7)
             plt.xlim(target_distances[:, a0, a1].min(), target_distances[:, a0, a1].max())
             plt.legend()
             plt.savefig(

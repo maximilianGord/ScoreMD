@@ -216,6 +216,10 @@ def _prepare_tsm_inputs(
         loss
         for loss in training_schedule.losses
         if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc", "fm")
+        or (
+            float(_loss_options(loss).get("time_lambda", 0.0)) > 0.0
+            and _loss_options(loss).get("time_target", "dsm") in ("tsm", "switch")
+        )
     ]
     if not force_losses:
         return train_data, val_data

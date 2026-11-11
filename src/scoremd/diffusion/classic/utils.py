@@ -110,6 +110,11 @@ def get_loss(
     tsm_mean_force_bank: Optional[str] = None,
     tsm_bank_target: str = "mean_force",
     tsm_bank_weight: float = 1.0,
+    time_lambda: float = 0.0,
+    time_target: str = "dsm",
+    time_sigma_max: float = 0.1,
+    time_weighting_scheme: str = "sigma4",
+    time_removed_dims: int = 0,
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -149,6 +154,19 @@ def get_loss(
       fm_t: For loss_type='fm' (pure force matching, no diffusion), the fixed time at which the model is
         evaluated on the clean data. The loss is |s(x, fm_t) - F(x)/kbT|^2; the sampled ts are ignored.
         Choose it equal to evaluation.eval_t so Langevin simulates the force that was trained.
+      time_lambda: Weight of the temporal loss w(t) (d/dt log q_theta(x_t, t) - T)^2 (Spatiotemporal Energy
+        Consistency), added on top of any loss_type except 'fm'; 0 disables it. Needs an energy model (log_q) and
+        is reported in the scalar_fp slot, so it cannot be combined with the scalar FP loss (beta > 0).
+        See :func:`_time_score_target`.
+      time_target: 'dsm' uses T = d/dt log p_t(x_t | x0) (as in the paper), 'tsm' the force-based target
+        T = beta_t / 2 (D + s0 . x0 - (alpha_t / sigma_t) s0 . eps) with s0 = F(x0) / kbT, and 'switch' the TSM
+        target for sigma_t <= time_sigma_max and the DSM target above. 'tsm' and 'switch' need forces.
+      time_sigma_max: Noise level below which 'switch' uses the TSM target.
+      time_weighting_scheme: w(t) = (sigma_t^2 / beta_t)^2 ('sigma4', bounds the 1 / sigma^4 variance of the DSM
+        target), sigma_t^2 / beta_t^2 ('sigma2', bounds the 1 / sigma^2 variance of the TSM target) or 1 ('none').
+      time_removed_dims: Coordinates without data variation that the model cannot see (3 for centred 3-D molecules,
+        where CenterMolecule removes the centre of mass). The TSM target uses D - time_removed_dims; the DSM target
+        keeps D, its centre-of-mass part only adds zero-mean noise.
 
     The returned loss function also accepts a keyword-only
     ``sigma_mode_sq_per_sample`` argument (a per-batch-sample array, sliced
@@ -163,6 +181,21 @@ def get_loss(
     """
     if loss_type not in ("dsm", "tsm", "sc", "fm"):
         raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', 'sc', or 'fm'.")
+    if time_lambda > 0.0:
+        if loss_type == "fm":
+            raise ValueError("The temporal loss (time_lambda > 0) is not available for loss_type='fm'.")
+        if beta > 1e-6:
+            raise ValueError("The temporal loss shares the scalar_fp slot with the scalar FP loss; set beta=0.")
+        if time_target not in ("dsm", "tsm", "switch"):
+            raise ValueError(f"Unknown time_target={time_target!r}. Use 'dsm', 'tsm' or 'switch'.")
+        if time_weighting_scheme not in ("sigma4", "sigma2", "none"):
+            raise ValueError(f"Unknown time_weighting_scheme={time_weighting_scheme!r}. Use 'sigma4', 'sigma2' or 'none'.")
+        if int(time_removed_dims) != time_removed_dims or time_removed_dims < 0:
+            raise ValueError(f"time_removed_dims must be a non-negative integer; got {time_removed_dims}.")
+        log.info(
+            f"Temporal loss: lambda={time_lambda}, target={time_target}, sigma_max={time_sigma_max}, "
+            f"weighting={time_weighting_scheme}, removed_dims={time_removed_dims}"
+        )
     if loss_type == "fm" and (alpha > 1e-6 or beta > 1e-6):
         raise ValueError("loss_type='fm' is pure force matching; set alpha=0 and beta=0 (no FP term).")
     valid_matching_types = ("constant", "hard_cutoff", "smooth_decay", "linear", "linear_decay", "noise_cutoff", "mode_mixture")
@@ -709,6 +742,45 @@ def get_loss(
                     reduce=reduce_op,
                 )
                 sc_loss = reduce_op(sc_per_sample)
+        if time_lambda > 0.0:
+            # temporal loss on d/dt log q_theta(x_t, t), reported in the scalar_fp slot (beta = 0 is enforced)
+            if time_target != "dsm" and (forces is None or force_batch is not None or tsm_sample is not None):
+                raise ValueError("time_target='tsm'/'switch' needs per-sample forces of the batch (no force_batch/bank).")
+            if not set(evaluated_models) <= set(model.energy_models()):
+                raise ValueError("The temporal loss needs energy models (log_q) for all evaluated models.")
+
+            def time_log_q(t_col):
+                log_q = model.apply(
+                    params,
+                    perturbed_data,
+                    features,
+                    t_col,
+                    training,
+                    evaluated_models,
+                    rngs={"dropout": dropout_rng},
+                    method=model.__class__.log_q,
+                )
+                return log_q.reshape(-1)
+
+            t_col = ts.reshape(-1, 1)
+            _, dlogq_dt = jax.jvp(time_log_q, (t_col,), (jnp.ones_like(t_col),))
+            target = _time_score_target(
+                sde,
+                batch,
+                perturbed_noise,
+                ts,
+                None if forces is None else forces / kbT,
+                time_target,
+                time_sigma_max,
+                removed_dims=int(time_removed_dims),
+            )
+            if time_weighting_scheme == "sigma4":
+                weight = jnp.square(sde.variance(ts) / sde.beta(ts))
+            elif time_weighting_scheme == "sigma2":
+                weight = sde.variance(ts) / jnp.square(sde.beta(ts))
+            else:
+                weight = jnp.ones_like(ts)
+            scalar_fp = time_lambda * jnp.mean(weight * jnp.square(dlogq_dt - target))
 
         return gamma * diffusion_loss, vector_fp, scalar_fp, tsm_component, sc_loss
 
@@ -1038,3 +1110,47 @@ def _sample_s_biased(
 
     use_bias = jax.random.uniform(choice_rng, shape=t.shape) < bias
     return jnp.where(use_bias, s_biased, s_uniform)
+
+
+def _time_score_target(
+    sde: Any,
+    x0: jnp.ndarray,
+    eps: jnp.ndarray,
+    t: jnp.ndarray,
+    data_score: Optional[jnp.ndarray],
+    target: str,
+    sigma_max: float,
+    removed_dims: int = 0,
+) -> jnp.ndarray:
+    """Regression target for d/dt log p_t(x_t) with x_t = alpha_t x0 + sigma_t eps (VP SDE).
+
+    Both targets have conditional mean d/dt log p_t(x_t) given x_t:
+
+      'dsm':  d/dt log p_t(x_t | x0) = -beta alpha (eps . x0) / (2 sigma) + beta alpha^2 (|eps|^2 - D) / (2 sigma^2)
+      'tsm':  beta / 2 (D + s0 . x0 - (alpha / sigma) s0 . eps),   s0 = grad log p_0(x0) (= F(x0) / kbT),
+
+    the latter from differentiating p_t(x) = int p_0((x - sigma eps) / alpha) alpha^-D N(eps) d eps in t. The DSM
+    target's variance grows as 1 / sigma^4 and the TSM target's as |s0|^2 / sigma^2 for small sigma, while the TSM
+    target is the noisier one at large sigma; 'switch' takes the TSM target for sigma_t <= sigma_max.
+    The TSM target needs a density of x0, so it counts only the D - ``removed_dims`` coordinates with variation
+    (the centre of mass of centred molecules is fixed; forces have no component along it).
+    """
+    batch_size = x0.shape[0]
+    x0 = x0.reshape((batch_size, -1))
+    eps = eps.reshape((batch_size, -1))
+    dim = x0.shape[-1]
+    alpha = jnp.exp(sde.log_mean_coeff(t))
+    sigma_sq = sde.variance(t)
+    sigma = jnp.sqrt(sigma_sq)
+    beta = sde.beta(t)
+
+    dsm = -0.5 * beta * alpha * jnp.sum(eps * x0, axis=-1) / sigma + 0.5 * beta * jnp.square(alpha) / sigma_sq * (
+        jnp.sum(jnp.square(eps), axis=-1) - dim
+    )
+    if target == "dsm":
+        return dsm
+    s0 = data_score.reshape((batch_size, -1))
+    tsm = 0.5 * beta * (dim - removed_dims + jnp.sum(s0 * x0, axis=-1) - alpha / sigma * jnp.sum(s0 * eps, axis=-1))
+    if target == "tsm":
+        return tsm
+    return jnp.where(sigma <= sigma_max, tsm, dsm)

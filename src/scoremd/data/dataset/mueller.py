@@ -11,6 +11,7 @@ from enum import Enum
 from scoremd.data.dataset.base import Datapoints
 from scoremd.utils.file import get_persistent_storage
 import hashlib
+import numpy as np
 
 from scoremd.utils.plots import rasterize_contour
 from . import Dataset
@@ -163,6 +164,7 @@ class MuellerBrownSimulation(Dataset):
         mode_var_computation: Literal["potential", "data_hessian", "data_empirical"] = "data_hessian",
         coarse_graining_level: MuellerBrownCoarseGrainingLevel | str = MuellerBrownCoarseGrainingLevel.NONE,
         enhanced: Optional[str] = None,
+        importance_weights: bool = False,
         name="mueller_brown",
     ):
         if mode_var_computation not in {"potential", "data_hessian", "data_empirical"}:
@@ -180,6 +182,11 @@ class MuellerBrownSimulation(Dataset):
         if enhanced is not None and enhanced not in available:
             raise ValueError(f"Unknown enhanced sampling bias {enhanced!r}; available: {available}.")
         self.enhanced = enhanced
+        # Reweight the biased force samples back to the unbiased ensemble (w = p / q) in the TSM term.
+        # Like ``enhanced``, intentionally not a dataclass field, so ``repr`` and all cache keys are unchanged.
+        if importance_weights and enhanced is None:
+            raise ValueError("importance_weights=True requires an enhanced sampling bias.")
+        self.importance_weights = importance_weights
         self.coarse_graining_level = (
             coarse_graining_level
             if isinstance(coarse_graining_level, MuellerBrownCoarseGrainingLevel)
@@ -287,6 +294,12 @@ class MuellerBrownSimulation(Dataset):
         # terms (TSM, SC anchor) use the biased trajectory (``force_data``) with unbiased forces.
         data = self._load_or_generate_trajectory(biased=False)
         force_data = self._load_or_generate_trajectory(biased=True) if self.enhanced is not None else None
+        # Computed on the full 2D frames, before any coarse-grained projection.
+        force_weights = (
+            jnp.asarray(self.force_importance_weights(force_data), dtype=force_data.dtype)
+            if self.importance_weights
+            else None
+        )
 
         if self._coordinate_index is not None:
             # Forces are projected from the full frames paired with the force positions.
@@ -294,7 +307,58 @@ class MuellerBrownSimulation(Dataset):
             data = data[:, self._coordinate_index : self._coordinate_index + 1]
             if force_data is not None:
                 force_data = force_data[:, self._coordinate_index : self._coordinate_index + 1]
-        return Datapoints(data, None, force_data=force_data), None, None
+        return Datapoints(data, None, force_data=force_data, force_weights=force_weights), None, None
+
+    def force_importance_weights(self, force_data: jnp.ndarray) -> np.ndarray:
+        """Importance weights ``w = p / q`` (mean 1) that map the biased frames back to the unbiased ensemble.
+
+        Single bias ``V``: ``q ∝ p exp(-V / kT)``, so ``w ∝ exp(V / kT)``.
+        Umbrella windows: ``q`` is the mixture of all windows, ``w ∝ 1 / sum_k N_k exp(f_k - V_k / kT)``,
+        with the window free energies ``f_k`` solved self-consistently (MBAR).
+        """
+        xs = np.asarray(force_data, dtype=np.float64).reshape(-1, 2)
+        if self.bias is not None:
+            log_w = np.asarray(self.bias_potential(jnp.asarray(xs)), dtype=np.float64) / self.kbT
+        else:
+            log_w, f_k = self._mbar_log_weights(xs, self.windows)
+            log.info("MBAR window free energies (kT): %s", np.array2string(f_k, precision=3))
+        w = np.exp(log_w - log_w.max())
+        w /= w.mean()
+        ess = w.sum() ** 2 / (w**2).sum()
+        log.info(
+            "Importance weights for %s: ESS = %.0f / %d (%.1f%%), max w = %.2f",
+            self.enhanced, ess, len(w), 100 * ess / len(w), w.max(),
+        )
+        return w
+
+    def _mbar_log_weights(self, xs: np.ndarray, windows: UmbrellaWindows, tol: float = 1e-10, max_iter: int = 10_000):
+        """Unnormalized log unbiased weights of pooled umbrella frames and the window free energies (MBAR)."""
+        centers = np.asarray(windows.centers(), dtype=np.float64)
+        mask = (np.arange(2) < windows.bias_dims).astype(np.float64)
+        # Reduced bias energies u_kn = V_k(x_n) / kT, shape (K, N).
+        diff = (xs[None, :, :] - centers[:, None, :]) * mask
+        u_kn = 0.5 * windows.k_spring * np.sum(diff**2, axis=-1) / self.kbT
+        # Frames per window, matching _generate_window_data (equal counts, last window truncated).
+        frames_per_window = -(-self.n_samples // windows.n_windows)
+        n_k = np.clip(len(xs) - frames_per_window * np.arange(windows.n_windows), 0, frames_per_window)
+        log_n_k = np.log(np.maximum(n_k, 1e-300))
+
+        def logsumexp(a, axis):
+            m = a.max(axis=axis, keepdims=True)
+            return np.squeeze(m, axis) + np.log(np.exp(a - m).sum(axis=axis))
+
+        f_k = np.zeros(windows.n_windows)
+        for _ in range(max_iter):
+            # log of the mixture density denominator per frame: log sum_k N_k exp(f_k - u_kn)
+            log_denom = logsumexp(log_n_k[:, None] + f_k[:, None] - u_kn, axis=0)
+            f_new = -logsumexp(-u_kn - log_denom[None, :], axis=1)
+            f_new -= f_new[0]
+            if np.max(np.abs(f_new - f_k)) < tol:
+                f_k = f_new
+                break
+            f_k = f_new
+        log_denom = logsumexp(log_n_k[:, None] + f_k[:, None] - u_kn, axis=0)
+        return -log_denom, f_k
 
     def _load_or_generate_trajectory(self, biased: bool) -> jnp.ndarray:
         key = jax.random.PRNGKey(self.seed)

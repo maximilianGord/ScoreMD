@@ -109,6 +109,7 @@ class TrainingSchedule(abc.ABC):
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
         tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
+        force_weights: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         """Use this train step when you have no clue about the ordering of t and it could be that each loss function needs to be called on it."""
 
@@ -126,6 +127,7 @@ class TrainingSchedule(abc.ABC):
             force_batch: Optional[ArrayLike] = None,
             progress: Optional[ArrayLike] = None,
             tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
+            force_weights: Optional[ArrayLike] = None,
         ) -> Tuple[ArrayLike, ArrayLike]:
             # `_train_step_single_loss` always calls its `loss_fn` with a
             # `sigma_mode_sq_per_sample` kwarg; accepted here for call
@@ -151,6 +153,7 @@ class TrainingSchedule(abc.ABC):
                         force_batch=force_batch,
                         progress=progress,
                         tsm_sample=tsm_sample,
+                        force_weights=force_weights,
                     ),
                     lambda: (jnp.sum(jnp.zeros(5)), jnp.zeros(5)),
                 )
@@ -173,6 +176,7 @@ class TrainingSchedule(abc.ABC):
             force_batch=force_batch,
             progress=progress,
             tsm_sample=tsm_sample,
+            force_weights=force_weights,
         )
 
     @staticmethod
@@ -190,6 +194,7 @@ class TrainingSchedule(abc.ABC):
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
         tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
+        force_weights: Optional[ArrayLike] = None,
     ) -> Tuple[EmaTrainState, ArrayLike]:
         if validation:
             _, loss = loss_fn(
@@ -206,6 +211,7 @@ class TrainingSchedule(abc.ABC):
                 force_batch=force_batch,
                 progress=progress,
                 tsm_sample=tsm_sample,
+                force_weights=force_weights,
             )
             return state, loss
         (_, loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(
@@ -222,6 +228,7 @@ class TrainingSchedule(abc.ABC):
             force_batch=force_batch,
             progress=progress,
             tsm_sample=tsm_sample,
+            force_weights=force_weights,
         )
 
         state = state.apply_gradients(grads=grads)
@@ -271,6 +278,8 @@ class TrainingSchedule(abc.ABC):
             current_sigma_mode_sq = (
                 datapoints.sigma_mode_sq[perm, ...] if datapoints.sigma_mode_sq is not None else None
             )
+            # importance weights of the biased force samples (enhanced sampling), passed to the TSM term
+            force_weights = datapoints.force_weights[perm] if datapoints.force_weights is not None else None
             current_tsm_t, current_tsm_noise = None, None
             if datapoints.tsm_t is not None:
                 # Precomputed TSM bank: one of the M stored (t, noise, force) draws per sample; its force replaces
@@ -334,6 +343,7 @@ class TrainingSchedule(abc.ABC):
                         force_batch=current_force_data,
                         progress=progress,
                         tsm_sample=tsm_sample,
+                        force_weights=force_weights,
                     )
                 else:
                     state, cur_loss = self._mixed_t_train_step(
@@ -350,6 +360,7 @@ class TrainingSchedule(abc.ABC):
                         force_batch=current_force_data,
                         progress=progress,
                         tsm_sample=tsm_sample,
+                        force_weights=force_weights,
                     )
                 cur_losses.append(cur_loss)
 

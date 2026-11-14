@@ -62,6 +62,8 @@ class ALDPDataset(Dataset):
         gmm_n_components: Optional[int] = None,
         gmm_covariance_type: Literal["full", "diag", "spherical", "block"] = "full",
         gmm_block_size: Optional[int] = None,
+        enhanced: Optional[str] = None,
+        importance_weights: bool = False,
         name="aldp",
     ):
         if mode_var_computation not in {
@@ -93,6 +95,19 @@ class ALDPDataset(Dataset):
         self.gmm_block_size = gmm_block_size
         self._dataset = None
         self._path = path
+        # Enhanced sampling (generate_aldp_metad.py): path to an npz with biased full-atom frames ``xyz`` (N, 22, 3)
+        # and the frozen bias ``bias`` (N,) in kJ/mol. The biased frames are exposed as ``train.force_data`` for the
+        # force-based terms (TSM / posterior TSM), with forces from the unbiased system; ``train.data`` (DSM) and the
+        # validation data stay unbiased. Like in MuellerBrownSimulation, intentionally not dataclass fields, so
+        # ``repr`` (and the cache keys built from it) are unchanged.
+        if enhanced is not None and str(enhanced).lower() == "none":
+            enhanced = None
+        if enhanced is not None and path is not None:
+            raise ValueError("enhanced sampling needs the full-atom ALDP data; it cannot be combined with path.")
+        if importance_weights and enhanced is None:
+            raise ValueError("importance_weights=True requires an enhanced sampling dataset (dataset.enhanced=<npz>).")
+        self.enhanced = enhanced
+        self.importance_weights = importance_weights
         self._train_force_coordinates = None
         self._val_force_coordinates = None
 
@@ -240,7 +255,42 @@ class ALDPDataset(Dataset):
                     full_coordinates[onp.asarray(val_indices)], val_unaligned, val_rotations
                 )
 
-        return Datapoints(train, None), Datapoints(val, None) if val is not None else None, None
+        val_data = Datapoints(val, None) if val is not None else None
+        if self.enhanced is None:
+            return Datapoints(train, None), val_data, None
+
+        force_data, biased_full, force_weights = self._load_enhanced(train)
+        self._train_force_coordinates = biased_full  # the force targets are evaluated on the biased frames
+        return Datapoints(train, None, force_data=force_data, force_weights=force_weights), val_data, None
+
+    def _load_enhanced(self, train: jnp.ndarray):
+        """Biased frames for the force-based terms: as many as training frames, CG-mapped and aligned to train[0]."""
+        biased = onp.load(self.enhanced)
+        xyz, bias = onp.asarray(biased["xyz"], dtype=onp.float64), onp.asarray(biased["bias"], dtype=onp.float64)
+        n = train.shape[0]
+        rng = onp.random.default_rng(self.seed)
+        if len(xyz) >= n:
+            idx = rng.permutation(len(xyz))[:n]
+        else:
+            log.warning(f"{self.enhanced} has only {len(xyz)} frames for {n} training frames; drawing with replacement.")
+            idx = rng.integers(0, len(xyz), size=n)
+        xyz, bias = xyz[idx], bias[idx]
+        unaligned = jnp.asarray(xyz[:, self._atoms_to_keep, :].reshape((n, -1)), dtype=train.dtype)
+        force_data, _, rotations = kabsch_align_many(unaligned, train[0], return_rotation=True)
+        biased_full = self._align_full_coordinates(xyz, unaligned, rotations)
+
+        force_weights = None
+        log_w = bias / self.kbT  # p / p_b ∝ exp(+V / kT) for a frozen bias V
+        w = onp.exp(log_w - log_w.max())
+        ess = w.sum() ** 2 / (w**2).sum()
+        log.info(
+            f"Enhanced sampling: {n} biased frames from {self.enhanced} for the force-based terms "
+            f"(bias {bias.min():.1f}..{bias.max():.1f} kJ/mol, importance-weight ESS {ess:.0f} = {100 * ess / n:.1f}%"
+            f"{', used' if self.importance_weights else ', not used'})."
+        )
+        if self.importance_weights:
+            force_weights = jnp.asarray(w / w.mean(), dtype=train.dtype)
+        return force_data, biased_full, force_weights
 
     def force(self, x: jnp.ndarray) -> jnp.ndarray:
         """

@@ -163,7 +163,8 @@ def get_loss(
         target for sigma_t <= time_sigma_max and the DSM target above. 'tsm' and 'switch' need forces.
       time_sigma_max: Noise level below which 'switch' uses the TSM target.
       time_weighting_scheme: w(t) = (sigma_t^2 / beta_t)^2 ('sigma4', bounds the 1 / sigma^4 variance of the DSM
-        target), sigma_t^2 / beta_t^2 ('sigma2', bounds the 1 / sigma^2 variance of the TSM target) or 1 ('none').
+        target), sigma_t^2 / beta_t^2 ('sigma2', bounds the 1 / sigma^2 variance of the TSM target),
+        sigma_t^2 c(t) / D^2 ('stec', as in the STEC paper, c = 5/3 for t <= 0.3 else 5/7) or 1 ('none').
       time_removed_dims: Coordinates without data variation that the model cannot see (3 for centred 3-D molecules,
         where CenterMolecule removes the centre of mass). The TSM target uses D - time_removed_dims; the DSM target
         keeps D, its centre-of-mass part only adds zero-mean noise.
@@ -188,8 +189,10 @@ def get_loss(
             raise ValueError("The temporal loss shares the scalar_fp slot with the scalar FP loss; set beta=0.")
         if time_target not in ("dsm", "tsm", "switch"):
             raise ValueError(f"Unknown time_target={time_target!r}. Use 'dsm', 'tsm' or 'switch'.")
-        if time_weighting_scheme not in ("sigma4", "sigma2", "none"):
-            raise ValueError(f"Unknown time_weighting_scheme={time_weighting_scheme!r}. Use 'sigma4', 'sigma2' or 'none'.")
+        if time_weighting_scheme not in ("sigma4", "sigma2", "stec", "none"):
+            raise ValueError(
+                f"Unknown time_weighting_scheme={time_weighting_scheme!r}. Use 'sigma4', 'sigma2', 'stec' or 'none'."
+            )
         if int(time_removed_dims) != time_removed_dims or time_removed_dims < 0:
             raise ValueError(f"time_removed_dims must be a non-negative integer; got {time_removed_dims}.")
         log.info(
@@ -267,6 +270,7 @@ def get_loss(
         force_batch: Optional[ArrayLike] = None,
         progress: Optional[ArrayLike] = None,
         tsm_sample: Optional[Tuple[ArrayLike, ArrayLike]] = None,
+        force_weights: Optional[ArrayLike] = None,
     ) -> Sequence[ArrayLike]:
         # Per-sample sigma_mode_sq (e.g. mode_var_computation="gmm_per_sample") overrides
         # the scalar `sigma_mode_sq` config value when supplied by the caller; otherwise
@@ -466,13 +470,14 @@ def get_loss(
         if tsm_sample is not None:
             bank_tsm = loss_type == "tsm" and tsm_type != "mode_mixture"
             bank_sc = loss_type == "sc" and sc_switch and sg_type != "mode_mixture"
-            if not (bank_tsm or bank_sc) or force_batch is not None:
+            if not (bank_tsm or bank_sc):
                 raise ValueError(
                     "A precomputed TSM bank needs loss_type='tsm' (non-mode_mixture tsm_type) or loss_type='sc' with "
-                    "sc_switch=True (non-mode_mixture sg_type), and no force_batch."
+                    "sc_switch=True (non-mode_mixture sg_type)."
                 )
             tsm_ts, tsm_noise = tsm_sample
-            tsm_mean, tsm_std = sde.marginal_prob(batch, tsm_ts)
+            # with enhanced sampling the bank belongs to the (biased) force positions, otherwise to the batch
+            tsm_mean, tsm_std = sde.marginal_prob(force_positions, tsm_ts)
             force_perturbed_data = tsm_mean + batch_mul(tsm_std, tsm_noise)
             force_score = score_fn(force_perturbed_data, features, tsm_ts)
 
@@ -501,6 +506,7 @@ def get_loss(
                     bond_pairs=tsm_bond_pairs,
                     reduce=reduce_op,
                 )
+                target_score_losses = _importance_weighted(target_score_losses, force_weights)
                 #combined_per_sample = losses*kappas*lambdas + target_score_losses*(1-kappas)
                 weighted_losses = score_unit_losses * kappas * lambdas
                 weighted_target_score_losses = target_score_losses*(1-kappas)
@@ -531,6 +537,7 @@ def get_loss(
                     # every bank sample lies in the TSM window, while with ts ~ U(range) only a fraction
                     # tsm_bank_weight of the samples does: rescale so the TSM term keeps its weight in the loss
                     target_score_losses = target_score_losses * tsm_bank_weight
+                target_score_losses = _importance_weighted(target_score_losses, force_weights)
                 #combined_per_sample = losses + target_score_losses
                 diffusion_loss = reduce_op(losses)
                 tsm_component = reduce_op(target_score_losses)
@@ -778,6 +785,12 @@ def get_loss(
                 weight = jnp.square(sde.variance(ts) / sde.beta(ts))
             elif time_weighting_scheme == "sigma2":
                 weight = sde.variance(ts) / jnp.square(sde.beta(ts))
+            elif time_weighting_scheme == "stec":
+                # STEC paper (arXiv 2611.10517): sigma_t^2 * c(t) / D^2, c = 5/3 for t <= 0.3 and 5/7 above; the 1/D^2
+                # keeps the scalar temporal residual (a sum over all D coordinates) on the scale of the DSM term
+                dim = batch.reshape((batch.shape[0], -1)).shape[-1]
+                c_t = jnp.where(ts <= 0.3, 5.0 / 3.0, 5.0 / 7.0)
+                weight = sde.variance(ts) * c_t / dim**2
             else:
                 weight = jnp.ones_like(ts)
             scalar_fp = time_lambda * jnp.mean(weight * jnp.square(dlogq_dt - target))
@@ -1082,6 +1095,18 @@ def _frontier_t(
     """
     p = jnp.clip(jnp.asarray(progress) / warmup, 0.0, 1.0) ** power
     return t_of_log_snr(log_snr_start + p * (log_snr_end - log_snr_start))
+
+
+def _importance_weighted(per_sample_losses: ArrayLike, force_weights: Optional[ArrayLike]) -> ArrayLike:
+    """Weight per-sample TSM losses on biased force samples by w = p / q, self-normalized over the batch.
+
+    The minimizer of the weighted loss is E_q[w s | x_t] / E_q[w | x_t] = E_p[s | x_t], i.e. the TSM target
+    of the unbiased ensemble. Without weights the TSM term regresses onto the biased posterior instead.
+    """
+    if force_weights is None:
+        return per_sample_losses
+    w = force_weights / jnp.maximum(jnp.mean(force_weights), 1e-12)
+    return per_sample_losses * jax.lax.stop_gradient(w).reshape(per_sample_losses.shape)
 
 
 def _sample_s_biased(

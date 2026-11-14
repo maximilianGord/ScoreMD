@@ -17,6 +17,9 @@ class Datapoints(struct.PyTreeNode):
     # the force targets are evaluated on biased samples.
     force_data: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
     sigma_mode_sq: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
+    # Optional per-sample importance weights for ``force_data`` (biased -> unbiased), shape (num_samples,).
+    # ``None`` leaves the force-based terms unweighted.
+    force_weights: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
     # Precomputed TSM targets (precompute_tsm_mean_force.py): per sample M draws of the noise time ``tsm_t``
     # (N, M), the normalized noise ``tsm_noise`` (N, M, D) and the force target ``tsm_forces`` (N, M, D) for
     # that noisy sample (e.g. the posterior mean force E[F(x0) | x_t]). Training draws one of the M per step.
@@ -50,7 +53,13 @@ class Datapoints(struct.PyTreeNode):
                     "sigma_mode_sq must have shape (num_samples,); got "
                     f"{self.sigma_mode_sq.shape} for data shape {self.data.shape}."
                 )
-        bank = (self.tsm_t, self.tsm_noise, self.tsm_forces)
+        if self.force_weights is not None:
+            if self.force_weights.shape != (self.data.shape[0],):
+                raise ValueError(
+                    "force_weights must have shape (num_samples,); got "
+                    f"{self.force_weights.shape} for data shape {self.data.shape}."
+                )
+        bank =(self.tsm_t, self.tsm_noise, self.tsm_forces)
         if any(b is not None for b in bank):
             if any(b is None for b in bank):
                 raise ValueError("tsm_t, tsm_noise and tsm_forces must be given together.")
@@ -72,6 +81,7 @@ class Datapoints(struct.PyTreeNode):
             forces=self.forces[idx] if self.forces is not None else None,
             force_data=self.force_data[idx] if self.force_data is not None else None,
             sigma_mode_sq=self.sigma_mode_sq[idx] if self.sigma_mode_sq is not None else None,
+            force_weights=self.force_weights[idx] if self.force_weights is not None else None,
             tsm_t=self.tsm_t[idx] if self.tsm_t is not None else None,
             tsm_noise=self.tsm_noise[idx] if self.tsm_noise is not None else None,
             tsm_forces=self.tsm_forces[idx] if self.tsm_forces is not None else None,

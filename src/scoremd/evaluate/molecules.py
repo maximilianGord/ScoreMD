@@ -29,6 +29,42 @@ import gc
 log = logging.getLogger(__name__)
 
 
+def plot_biased_free_energies(dataset, target_phi, target_psi, sampled_phi, sampled_psi, path_prefix: str, title=None):
+    """With enhanced sampling (dataset.enhanced = metadynamics npz): phi/psi free energies of the target, the biased
+    training data, and the samples, saved as <path_prefix>_{phi,psi}_free_energy_biased.png. The biased reference is
+    the phi/psi of all metadynamics frames (backbone dihedrals, identical for every CG mapping that keeps the
+    backbone). Never lets a plotting problem break the evaluation; returns the written paths."""
+    enhanced = getattr(dataset, "enhanced", None)
+    if enhanced is None:
+        return []
+    try:
+        biased = onp.load(enhanced)
+        biased_phi, biased_psi = biased["phi"], biased["psi"]
+        paths = []
+        for name, target, bias, sampled, fes, ylim, xlabel in (
+            ("phi", target_phi, biased_phi, sampled_phi, FES_PHI, dict(bottom=-5, top=50), r"$\varphi$"),
+            ("psi", target_psi, biased_psi, sampled_psi, FES_PSI, dict(top=25), r"$\psi$"),
+        ):
+            plt.figure(clear=True)
+            if title:
+                plt.title(title)
+            plot_fes_angles(jnp.asarray(target), dataset.kbT, label="Target", **fes)
+            plot_fes_angles(jnp.asarray(bias), dataset.kbT, label="Biased (MetaD data)", linestyle=":", color="0.4", **fes)
+            plot_fes_angles(jnp.asarray(sampled), dataset.kbT, label="Sampled", linestyle="--", **fes)
+            plt.xlabel(xlabel)
+            plt.ylim(**ylim)
+            plt.legend()
+            path = f"{path_prefix}_{name}_free_energy_biased.png"
+            plt.savefig(path, bbox_inches="tight")
+            plt.close()
+            paths.append(path)
+        return paths
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"Biased free-energy plots failed: {e}")
+        plt.close("all")
+        return []
+
+
 def _structure_metrics(dataset, target, sampled, out_path: str, title: str, key_prefix: str) -> dict:
     """Pooled bond-length / bond-angle summary plot; never lets a plotting problem break the evaluation."""
     try:
@@ -76,6 +112,7 @@ def evaluate_iid_samples(
     plt.legend()
     plt.savefig(f"{out_dir}/{prefix}_iid_psi_free_energy.png", bbox_inches="tight")
     plt.close()
+    plot_biased_free_energies(dataset, target_phi, target_psi, sampled_phi, sampled_psi, f"{out_dir}/{prefix}_iid")
 
     if isinstance(dataset, SingleProteinDataset):
         plt.figure(clear=True)
@@ -305,6 +342,9 @@ def evaluate_langevin_samples(
         plt.legend()
         plt.savefig(f"{out_dir}/{prefix}_langevin_psi_free_energy{empty_if_none(i, f'_{i}')}.png", bbox_inches="tight")
         plt.close()
+        if i is None:  # all trajectories together only
+            plot_biased_free_energies(dataset, target_phi, target_psi, current_phi, current_psi,
+                                      f"{out_dir}/{prefix}_langevin", title=f"Free energy {prefix} (simulated)")
 
         if wandb and i is None:  # only log full trajectory
             wandb_lib.log(

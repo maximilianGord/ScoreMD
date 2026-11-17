@@ -115,6 +115,14 @@ def get_loss(
     time_sigma_max: float = 0.1,
     time_weighting_scheme: str = "sigma4",
     time_removed_dims: int = 0,
+    fdual_sigma_mode: Optional[float] = None,
+    fdual_posterior: str = "all",
+    fdual_raw_share: float = 0.0,
+    fdual_space_weighting: str = "dsm",
+    fdual_schedule: str = "blend",
+    fdual_sigma_max: float = 0.1,
+    fdual_force_lambda: float = 0.001,
+    fdual_force_time_weighting: str = "sigma2",
     **kwargs,
 ):
     """Create a loss function for score matching training.
@@ -168,6 +176,32 @@ def get_loss(
       time_removed_dims: Coordinates without data variation that the model cannot see (3 for centred 3-D molecules,
         where CenterMolecule removes the centre of mass). The TSM target uses D - time_removed_dims; the DSM target
         keeps D, its centre-of-mass part only adds zero-mean noise.
+      loss_type='fdual': force-informed dual score matching. The spatial loss regresses the score onto the blend
+        c(t) (-eps / sigma_t) + (1 - c(t)) F(x0) / (alpha_t kbT) and, with time_lambda > 0 and time_target='fdual',
+        the temporal loss regresses d/dt log q_theta onto the same blend of the 'dsm' and 'tsm' time targets, with
+        c(t) = sigma_t^2 / (sigma_t^2 + alpha_t^2 sigma_mode^2) (DSM at large noise, forces at small noise). Every
+        target is unbiased for the same conditional mean, so the minimiser is that of DSM; only the variance drops.
+        Needs per-sample forces of the batch itself (no enhanced sampling / TSM bank). See :func:`_fdual_targets`.
+      fdual_sigma_mode: Noise level (normalised coordinates, like tsm_sigma_max) at which c = 1/2, i.e. the variance
+        of a Gaussian mode for which the blend is variance-optimal. None uses the dataset's sigma_mode_sq
+        (dataset.mode_var_computation, set by train.py); a per-sample sigma_mode_sq is rejected, since a blend weight
+        that depends on x0 would bias the target. 0 gives plain DSM (c = 1).
+      fdual_posterior: 'all' (default) replaces both target parts by their in-batch posterior average (Rao-
+        Blackwellised, exactly unbiased, never more variance than the raw targets), 'force' only the force part,
+        'none' uses the raw per-sample targets.
+      fdual_raw_share: Constant fraction of the force part kept raw (0 = pure posterior); ignored for 'none'.
+      fdual_space_weighting: 'dsm' weights the spatial loss like DSM (sigma_t^2, or g^2 with likelihood weighting,
+        times time_weighting), so c = 1 reproduces the DSM loss; 'constant' uses time_weighting only (TSM-like).
+      fdual_schedule: 'blend' (default) regresses onto the c(t)-blended targets above. 'cutoff' keeps the DSM
+        components on at every t and adds the force components below a noise cutoff, as separate terms (like
+        tsm_type='noise_cutoff'): spatial loss = DSM term (fdual_space_weighting) + fdual_force_lambda *
+        time_weighting * |s - force target|^2 for sigma_t <= fdual_sigma_max (reported in the TSM slot); temporal loss
+        = time_lambda * [w(t) (d/dt log q - DSM time target)^2 + fdual_force_lambda * w_F(t) (d/dt log q - force time
+        target)^2 for sigma_t <= fdual_sigma_max], with w = time_weighting_scheme and w_F = fdual_force_time_weighting
+        (default 'sigma2': each term weighted by the inverse variance of its target; 'relative' uses w(t) / sigma_t^2,
+        i.e. the same inverse-variance ratio between the two terms for any time_weighting_scheme, and equals 'sigma2'
+        for time_weighting_scheme='sigma4'). All weights depend on t only, so
+        the minimiser is unchanged (unbiased). fdual_sigma_mode is not used.
 
     The returned loss function also accepts a keyword-only
     ``sigma_mode_sq_per_sample`` argument (a per-batch-sample array, sliced
@@ -180,15 +214,50 @@ def get_loss(
     Returns:
       A loss function that can be used for score matching training and is an expectation of the regression loss over time.
     """
-    if loss_type not in ("dsm", "tsm", "sc", "fm"):
-        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', 'sc', or 'fm'.")
+    if loss_type not in ("dsm", "tsm", "sc", "fm", "fdual"):
+        raise ValueError(f"Unknown loss_type={loss_type!r}. Use 'dsm', 'tsm', 'sc', 'fm' or 'fdual'.")
+    if loss_type == "fdual":
+        if fdual_posterior not in ("none", "force", "all"):
+            raise ValueError(f"Unknown fdual_posterior={fdual_posterior!r}. Use 'none', 'force' or 'all'.")
+        if not 0.0 <= fdual_raw_share <= 1.0:
+            raise ValueError(f"fdual_raw_share must be in [0, 1]; got {fdual_raw_share}.")
+        if fdual_space_weighting not in ("dsm", "constant"):
+            raise ValueError(f"Unknown fdual_space_weighting={fdual_space_weighting!r}. Use 'dsm' or 'constant'.")
+        if fdual_schedule not in ("blend", "cutoff"):
+            raise ValueError(f"Unknown fdual_schedule={fdual_schedule!r}. Use 'blend' or 'cutoff'.")
+        if fdual_schedule == "cutoff" and (fdual_sigma_max <= 0.0 or fdual_force_lambda < 0.0):
+            raise ValueError("fdual_schedule='cutoff' needs fdual_sigma_max > 0 and fdual_force_lambda >= 0.")
+        if fdual_force_time_weighting not in ("sigma4", "sigma2", "stec", "none", "relative"):
+            raise ValueError(f"Unknown fdual_force_time_weighting={fdual_force_time_weighting!r}.")
+        if fdual_sigma_mode is not None and fdual_sigma_mode < 0.0:
+            raise ValueError(f"fdual_sigma_mode must be >= 0; got {fdual_sigma_mode}.")
+        if sliced:
+            raise ValueError("loss_type='fdual' is a denoising loss; sliced score matching is not supported.")
+        if tsm_force_contribution != "absolute":
+            raise ValueError("loss_type='fdual' needs the absolute forces (tsm_force_contribution='absolute').")
+        if tsm_mean_force_bank is not None:
+            raise ValueError("loss_type='fdual' averages the forces in the batch itself; do not set tsm_mean_force_bank.")
+        if time_lambda > 0.0 and time_target != "fdual":
+            raise ValueError("loss_type='fdual' with time_lambda > 0 needs time_target='fdual' (the blended target).")
+        log.info(
+            f"fdual: schedule={fdual_schedule}, "
+            + (
+                f"sigma_max={fdual_sigma_max}, force_lambda={fdual_force_lambda}, "
+                f"force_time_weighting={fdual_force_time_weighting}, "
+                if fdual_schedule == "cutoff"
+                else f"sigma_mode={'dataset' if fdual_sigma_mode is None else fdual_sigma_mode}, "
+            )
+            + f"posterior={fdual_posterior}, raw_share={fdual_raw_share}, space_weighting={fdual_space_weighting}"
+        )
     if time_lambda > 0.0:
         if loss_type == "fm":
             raise ValueError("The temporal loss (time_lambda > 0) is not available for loss_type='fm'.")
         if beta > 1e-6:
             raise ValueError("The temporal loss shares the scalar_fp slot with the scalar FP loss; set beta=0.")
-        if time_target not in ("dsm", "tsm", "switch"):
-            raise ValueError(f"Unknown time_target={time_target!r}. Use 'dsm', 'tsm' or 'switch'.")
+        if time_target not in ("dsm", "tsm", "switch", "fdual"):
+            raise ValueError(f"Unknown time_target={time_target!r}. Use 'dsm', 'tsm', 'switch' or 'fdual'.")
+        if time_target == "fdual" and loss_type != "fdual":
+            raise ValueError("time_target='fdual' needs loss_type='fdual'.")
         if time_weighting_scheme not in ("sigma4", "sigma2", "stec", "none"):
             raise ValueError(
                 f"Unknown time_weighting_scheme={time_weighting_scheme!r}. Use 'sigma4', 'sigma2', 'stec' or 'none'."
@@ -452,6 +521,73 @@ def get_loss(
             e_score = e if likelihood_weighting else batch_mul(e, 1.0 / std)
             score_unit_losses = reduce_op(jnp.square(e_score).reshape((e_score.shape[0], -1)), axis=-1)
             score_unit_losses *= time_weighting(ts)
+
+        fdual_time = None
+        if loss_type == "fdual":
+            # Force-informed dual score matching: the spatial loss replaces the DSM loss (same noisy sample and
+            # weighting, blended target); the time target is used by the temporal loss below.
+            if forces is None:
+                raise ValueError("loss_type='fdual' requires precomputed per-sample forces.")
+            if force_batch is not None or tsm_sample is not None or force_weights is not None:
+                raise ValueError(
+                    "loss_type='fdual' needs the forces of the batch itself; enhanced sampling (biased force samples) "
+                    "and a precomputed TSM bank are not supported."
+                )
+
+            def fdual_space_loss(target, dsm_weighting):
+                per_sample = reduce_op(jnp.square(score - target).reshape((score.shape[0], -1)), axis=-1)
+                if dsm_weighting:
+                    # DSM: |eps + sigma s|^2 = sigma^2 |s + eps / sigma|^2, with likelihood weighting g^2 |s + eps/sigma|^2
+                    per_sample = per_sample * (sde.beta(ts) if likelihood_weighting else jnp.square(std))
+                return per_sample * time_weighting(ts)
+
+            if fdual_schedule == "cutoff":
+                # DSM components at every t, force components as extra terms for sigma_t <= fdual_sigma_max
+                dsm_space, force_space, fdual_dsm_time, fdual_force_time = _fdual_components(
+                    sde,
+                    batch,
+                    perturbed_data,
+                    perturbed_noise,
+                    ts,
+                    forces / kbT,
+                    features,
+                    posterior=fdual_posterior,
+                    raw_share=fdual_raw_share,
+                    removed_dims=int(time_removed_dims),
+                    with_time=time_lambda > 0.0,
+                )
+                fdual_force_on = (std <= fdual_sigma_max).astype(batch.dtype)
+                diffusion_loss = jnp.mean(fdual_space_loss(dsm_space, fdual_space_weighting == "dsm"))
+                tsm_component = jnp.mean(
+                    fdual_force_lambda * fdual_force_on * fdual_space_loss(force_space, dsm_weighting=False)
+                )
+            else:
+                if fdual_sigma_mode is not None:
+                    fdual_sigma_mode_sq = fdual_sigma_mode**2
+                elif sigma_mode_sq_per_sample is not None:
+                    raise ValueError(
+                        "loss_type='fdual' got a per-sample sigma_mode_sq; a blend weight that depends on x0 would bias the "
+                        "target. Set fdual_sigma_mode or use a scalar dataset.mode_var_computation."
+                    )
+                elif sigma_mode_sq is None:
+                    raise ValueError("loss_type='fdual' needs fdual_sigma_mode or the dataset's sigma_mode_sq (train.py).")
+                else:
+                    fdual_sigma_mode_sq = sigma_mode_sq
+                fdual_space, fdual_time = _fdual_targets(
+                    sde,
+                    batch,
+                    perturbed_data,
+                    perturbed_noise,
+                    ts,
+                    forces / kbT,
+                    features,
+                    fdual_sigma_mode_sq,
+                    posterior=fdual_posterior,
+                    raw_share=fdual_raw_share,
+                    removed_dims=int(time_removed_dims),
+                    with_time=time_lambda > 0.0,
+                )
+                diffusion_loss = jnp.mean(fdual_space_loss(fdual_space, fdual_space_weighting == "dsm"))
 
         # Positions for the force-based terms (TSM, SC force anchor). By default the forces belong to
         # ``batch``; with ``force_batch`` (enhanced sampling) they belong to separately sampled (biased)
@@ -771,29 +907,45 @@ def get_loss(
 
             t_col = ts.reshape(-1, 1)
             _, dlogq_dt = jax.jvp(time_log_q, (t_col,), (jnp.ones_like(t_col),))
-            target = _time_score_target(
-                sde,
-                batch,
-                perturbed_noise,
-                ts,
-                None if forces is None else forces / kbT,
-                time_target,
-                time_sigma_max,
-                removed_dims=int(time_removed_dims),
-            )
-            if time_weighting_scheme == "sigma4":
-                weight = jnp.square(sde.variance(ts) / sde.beta(ts))
-            elif time_weighting_scheme == "sigma2":
-                weight = sde.variance(ts) / jnp.square(sde.beta(ts))
-            elif time_weighting_scheme == "stec":
-                # STEC paper (arXiv 2611.10517): sigma_t^2 * c(t) / D^2, c = 5/3 for t <= 0.3 and 5/7 above; the 1/D^2
-                # keeps the scalar temporal residual (a sum over all D coordinates) on the scale of the DSM term
-                dim = batch.reshape((batch.shape[0], -1)).shape[-1]
-                c_t = jnp.where(ts <= 0.3, 5.0 / 3.0, 5.0 / 7.0)
-                weight = sde.variance(ts) * c_t / dim**2
+            def time_weight(scheme):
+                if scheme == "relative":  # fdual force time term: DSM time weighting / sigma_t^2
+                    return time_weight(time_weighting_scheme) / sde.variance(ts)
+                if scheme == "sigma4":
+                    return jnp.square(sde.variance(ts) / sde.beta(ts))
+                if scheme == "sigma2":
+                    return sde.variance(ts) / jnp.square(sde.beta(ts))
+                if scheme == "stec":
+                    # STEC paper (arXiv 2611.10517): sigma_t^2 * c(t) / D^2, c = 5/3 for t <= 0.3 and 5/7 above; the
+                    # 1/D^2 keeps the scalar temporal residual (a sum over all D coordinates) on the scale of the DSM term
+                    dim = batch.reshape((batch.shape[0], -1)).shape[-1]
+                    c_t = jnp.where(ts <= 0.3, 5.0 / 3.0, 5.0 / 7.0)
+                    return sde.variance(ts) * c_t / dim**2
+                return jnp.ones_like(ts)
+
+            if time_target == "fdual" and fdual_schedule == "cutoff":
+                # DSM time term at every t + force time term below the cutoff, each with its own weighting
+                scalar_fp = time_lambda * jnp.mean(
+                    time_weight(time_weighting_scheme) * jnp.square(dlogq_dt - fdual_dsm_time)
+                    + fdual_force_lambda
+                    * fdual_force_on
+                    * time_weight(fdual_force_time_weighting)
+                    * jnp.square(dlogq_dt - fdual_force_time)
+                )
             else:
-                weight = jnp.ones_like(ts)
-            scalar_fp = time_lambda * jnp.mean(weight * jnp.square(dlogq_dt - target))
+                if time_target == "fdual":
+                    target = fdual_time  # blended (posterior-averaged) target from the fdual block above
+                else:
+                    target = _time_score_target(
+                        sde,
+                        batch,
+                        perturbed_noise,
+                        ts,
+                        None if forces is None else forces / kbT,
+                        time_target,
+                        time_sigma_max,
+                        removed_dims=int(time_removed_dims),
+                    )
+                scalar_fp = time_lambda * jnp.mean(time_weight(time_weighting_scheme) * jnp.square(dlogq_dt - target))
 
         return gamma * diffusion_loss, vector_fp, scalar_fp, tsm_component, sc_loss
 
@@ -1179,3 +1331,140 @@ def _time_score_target(
     if target == "tsm":
         return tsm
     return jnp.where(sigma <= sigma_max, tsm, dsm)
+
+
+def _fdual_dsm_share(sde: Any, t: jnp.ndarray, sigma_mode_sq: ArrayLike) -> jnp.ndarray:
+    """DSM share c(t) = sigma_t^2 / (sigma_t^2 + alpha_t^2 sigma_mode^2) of the blended fdual targets.
+
+    It depends on t only (never on x0, eps or the batch), so blending unbiased targets with it stays unbiased. For a
+    Gaussian mode of variance sigma_mode^2 this c makes the blended spatial target exactly zero-variance given x_t
+    (the De Bortoli et al. TSM mixture) and cancels the quadratic noise term of the blended time target.
+    """
+    sigma_sq = sde.variance(t)
+    alpha_sq = jnp.exp(2.0 * sde.log_mean_coeff(t))
+    return sigma_sq / (sigma_sq + alpha_sq * jnp.asarray(sigma_mode_sq, dtype=sigma_sq.dtype))
+
+
+def _fdual_components(
+    sde: Any,
+    x0: jnp.ndarray,
+    x_t: jnp.ndarray,
+    eps: jnp.ndarray,
+    t: jnp.ndarray,
+    data_score: jnp.ndarray,
+    features: Optional[jnp.ndarray],
+    posterior: str = "force",
+    raw_share: float = 0.0,
+    removed_dims: int = 0,
+    with_time: bool = True,
+) -> Tuple[jnp.ndarray, jnp.ndarray, Optional[jnp.ndarray], Optional[jnp.ndarray]]:
+    """DSM and force components of the spatial and temporal targets of force-informed dual score matching.
+
+    x_t = alpha_t x0 + sigma_t eps (VP), data_score = grad log p_0(x0) = F(x0) / kbT. Per sample k:
+
+      spatial:  c (DSM part) + (1 - c) (force part),  DSM part -eps / sigma,  force part s0 / alpha
+      time:     c (DSM part) + (1 - c) (force part),  the 'dsm' and 'tsm' targets of :func:`_time_score_target`
+
+    with c = :func:`_fdual_dsm_share`. Every part is a function g(x_t, x0, s0) whose conditional mean given x_t is
+    the true spatial (time) score, so the blend has the same minimiser as DSM / the standard time target.
+
+    posterior='force' (or 'all') replaces the force part (and the DSM part) g(x_t, x0_k, s0_k) by its in-batch
+    posterior average sum_i w_ki g(x_t, x0_i, s0_i), w_ki = softmax_i(-|x_t,k - alpha_t x0_i|^2 / (2 sigma_t^2)), over
+    the batch INCLUDING sample k itself (and only over samples with the same features). Because the batch is
+    exchangeable (shuffled without replacement, augmented per sample) and contains the generating sample, w_k is the
+    exact posterior of which batch sample generated x_t,k, so the average is E[g(x_t, x0_J, s0_J) | x_t, batch]: an
+    exactly unbiased estimator for any batch size, and a Rao-Blackwellisation of the raw part (never more variance).
+    The leave-one-out average (sample k excluded) would be a biased self-normalised importance sampler and is
+    deliberately not offered. ``raw_share`` keeps a constant fraction of the raw force part (0 = pure posterior).
+
+    Returns (DSM spatial, force spatial, DSM time, force time); the time parts are None if not ``with_time``.
+    The loss either blends them (:func:`_fdual_targets`, fdual_schedule='blend') or uses them as separate terms
+    (fdual_schedule='cutoff').
+    """
+    batch_size = x0.shape[0]
+    x0_flat = x0.reshape((batch_size, -1))
+    xt_flat = x_t.reshape((batch_size, -1))
+    eps_flat = eps.reshape((batch_size, -1))
+    s0 = data_score.reshape((batch_size, -1))
+    dim = x0_flat.shape[-1]
+    alpha = jnp.exp(sde.log_mean_coeff(t))
+    sigma_sq = sde.variance(t)
+    sigma = jnp.sqrt(sigma_sq)
+    beta = sde.beta(t)
+
+    # raw parts (sample k only)
+    dsm_space = -eps_flat / sigma[:, None]
+    force_space = s0 / alpha[:, None]
+    dsm_time = force_time = None
+    if with_time:
+        dsm_time = _time_score_target(sde, x0, eps, t, None, "dsm", 0.0, removed_dims=removed_dims)
+        force_time = _time_score_target(sde, x0, eps, t, data_score, "tsm", 0.0, removed_dims=removed_dims)
+
+    if posterior != "none":
+        # diff[k, i] = x_t,k - alpha_k x0_i = sigma_k eps_ki; computed directly (no |a|^2 - 2ab + |b|^2 cancellation)
+        diff = xt_flat[:, None, :] - alpha[:, None, None] * x0_flat[None, :, :]
+        dist_sq = jnp.sum(jnp.square(diff), axis=-1)
+        logits = -dist_sq / (2.0 * sigma_sq[:, None])
+        if features is not None:
+            f = features.reshape((batch_size, -1))
+            same = jnp.all(f[:, None, :] == f[None, :, :], axis=-1)  # diagonal always True: self is kept
+            logits = jnp.where(same, logits, -jnp.inf)
+        w = jax.lax.stop_gradient(jax.nn.softmax(logits, axis=1))
+
+        post_force_space = (w @ s0) / alpha[:, None]
+        force_space = raw_share * force_space + (1.0 - raw_share) * post_force_space
+        if posterior == "all":
+            dsm_space = -(xt_flat - alpha[:, None] * (w @ x0_flat)) / sigma_sq[:, None]
+
+        if with_time:
+            # s0_i . eps_ki and x0_i . eps_ki, eps_ki = diff[k, i] / sigma_k
+            s_dot_eps = jnp.einsum("kid,id->ki", diff, s0) / sigma[:, None]
+            s_dot_x = jnp.sum(s0 * x0_flat, axis=-1)
+            post_force_time = 0.5 * beta * (
+                dim - removed_dims + w @ s_dot_x - alpha / sigma * jnp.sum(w * s_dot_eps, axis=1)
+            )
+            force_time = raw_share * force_time + (1.0 - raw_share) * post_force_time
+            if posterior == "all":
+                x_dot_eps = jnp.einsum("kid,id->ki", diff, x0_flat) / sigma[:, None]
+                eps_sq = dist_sq / sigma_sq[:, None]
+                dsm_ki = -0.5 * (beta * alpha / sigma)[:, None] * x_dot_eps + 0.5 * (beta * jnp.square(alpha) / sigma_sq)[
+                    :, None
+                ] * (eps_sq - dim)
+                dsm_time = jnp.sum(w * dsm_ki, axis=1)
+
+    sg = jax.lax.stop_gradient
+    shape = x0.shape
+    return (
+        sg(dsm_space.reshape(shape)),
+        sg(force_space.reshape(shape)),
+        None if dsm_time is None else sg(dsm_time),
+        None if force_time is None else sg(force_time),
+    )
+
+
+def _fdual_targets(
+    sde: Any,
+    x0: jnp.ndarray,
+    x_t: jnp.ndarray,
+    eps: jnp.ndarray,
+    t: jnp.ndarray,
+    data_score: jnp.ndarray,
+    features: Optional[jnp.ndarray],
+    sigma_mode_sq: ArrayLike,
+    posterior: str = "force",
+    raw_share: float = 0.0,
+    removed_dims: int = 0,
+    with_time: bool = True,
+) -> Tuple[jnp.ndarray, Optional[jnp.ndarray]]:
+    """Blended fdual targets c(t) DSM part + (1 - c(t)) force part, see :func:`_fdual_components`.
+
+    Returns the spatial target (shape of x0) and the time target (batch,) or None if not ``with_time``.
+    """
+    dsm_space, force_space, dsm_time, force_time = _fdual_components(
+        sde, x0, x_t, eps, t, data_score, features, posterior, raw_share, removed_dims, with_time
+    )
+    c = _fdual_dsm_share(sde, t, sigma_mode_sq)
+    c_space = c.reshape((-1,) + (1,) * (x0.ndim - 1))
+    space = c_space * dsm_space + (1.0 - c_space) * force_space
+    time = None if not with_time else c * dsm_time + (1.0 - c) * force_time
+    return space, time

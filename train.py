@@ -82,7 +82,7 @@ def _precompute_forces(dataset: Dataset, datapoints: Optional[Datapoints]) -> Op
     if datapoints is None or datapoints.forces is not None:
         return datapoints
     if not hasattr(dataset, "force") or not callable(dataset.force):
-        raise TypeError("loss_type='tsm', 'sc' or 'fm' requires a dataset with a callable force(frame) method.")
+        raise TypeError("loss_type='tsm', 'sc', 'fm' or 'fdual' requires a dataset with a callable force(frame) method.")
 
     sample_shape = tuple(dataset.sample_shape)
     if datapoints.data.shape[1] != int(np.prod(sample_shape)):
@@ -215,7 +215,7 @@ def _prepare_tsm_inputs(
     force_losses = [
         loss
         for loss in training_schedule.losses
-        if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc", "fm")
+        if _loss_options(loss).get("loss_type", "dsm") in ("tsm", "sc", "fm", "fdual")
         or (
             float(_loss_options(loss).get("time_lambda", 0.0)) > 0.0
             and _loss_options(loss).get("time_target", "dsm") in ("tsm", "switch")
@@ -234,6 +234,12 @@ def _prepare_tsm_inputs(
         or (
             _loss_options(loss).get("loss_type") == "sc"
             and _loss_options(loss).get("sg_type", "constant") == "mode_mixture"
+        )
+        or (
+            # the fdual blend without an explicit fdual_sigma_mode uses the dataset's mode variance (not the cutoff)
+            _loss_options(loss).get("loss_type") == "fdual"
+            and _loss_options(loss).get("fdual_schedule", "blend") == "blend"
+            and _loss_options(loss).get("fdual_sigma_mode") is None
         )
     ]
     if mode_mixture_losses:

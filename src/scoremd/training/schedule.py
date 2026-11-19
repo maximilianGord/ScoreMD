@@ -280,7 +280,7 @@ class TrainingSchedule(abc.ABC):
             )
             # importance weights of the biased force samples (enhanced sampling), passed to the TSM term
             force_weights = datapoints.force_weights[perm] if datapoints.force_weights is not None else None
-            current_tsm_t, current_tsm_noise = None, None
+            current_tsm_t, current_tsm_noise, current_tsm_fx = None, None, None
             if datapoints.tsm_t is not None:
                 # Precomputed TSM bank: one of the M stored (t, noise, force) draws per sample; its force replaces
                 # the per-frame force, and is rotated with the data below like the forces.
@@ -289,6 +289,8 @@ class TrainingSchedule(abc.ABC):
                 current_tsm_t = datapoints.tsm_t[perm, draw]
                 current_tsm_noise = datapoints.tsm_noise[perm, draw]
                 current_forces = datapoints.tsm_forces[perm, draw]
+                if datapoints.tsm_fx is not None:  # scalar (rotation invariant), same draw
+                    current_tsm_fx = datapoints.tsm_fx[perm, draw]
             if data_sharding is not None:
                 current_data = jax.lax.with_sharding_constraint(current_data, data_sharding)
                 if current_features is not None:
@@ -322,6 +324,8 @@ class TrainingSchedule(abc.ABC):
                 elif self.augment is not IDENTITY:
                     raise ValueError("A precomputed TSM bank supports only no augmentation or random rotations.")
                 tsm_sample = (current_tsm_t, current_tsm_noise)
+                if current_tsm_fx is not None:
+                    tsm_sample = (current_tsm_t, current_tsm_noise, current_tsm_fx)
 
             cur_losses = []
             for ts, possible_loss in sample_ts(iter_key):

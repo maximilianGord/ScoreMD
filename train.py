@@ -150,7 +150,8 @@ def _attach_tsm_bank(train_data: Datapoints, force_losses) -> Datapoints:
     term then uses those instead of the DSM sample and the per-frame force (see get_loss, tsm_mean_force_bank). The
     force term is the TSM term (loss_type='tsm', tsm_type='noise_cutoff', window tsm_sigma_max) or the force anchor
     of the sc switch (loss_type='sc', sc_switch=True, window force_sigma_max; the semigroup term above it needs no
-    force targets).
+    force targets), or the force terms of the dual force loss (loss_type='fdual', fdual_schedule='cutoff', window
+    fdual_sigma_max; its temporal force term also needs the bank's mean_force_dot_x = E[F . x0 | x_t]).
     """
     banks = [loss for loss in force_losses if _loss_options(loss).get("tsm_mean_force_bank")]
     if not banks:
@@ -164,9 +165,12 @@ def _attach_tsm_bank(train_data: Datapoints, force_losses) -> Datapoints:
         window_key, window = "tsm_sigma_max", options.get("tsm_sigma_max", 0.01)
     elif loss_type == "sc" and options.get("sc_switch", False) and options.get("sg_type") != "mode_mixture":
         window_key, window = "force_sigma_max", options.get("force_sigma_max", 0.01)
+    elif loss_type == "fdual" and options.get("fdual_schedule", "blend") == "cutoff":
+        window_key, window = "fdual_sigma_max", options.get("fdual_sigma_max", 0.1)
     else:
-        raise ValueError("tsm_mean_force_bank requires loss_type='tsm' with tsm_type='noise_cutoff', or loss_type='sc' "
-                         "with sc_switch=True and a non-mode_mixture sg_type.")
+        raise ValueError("tsm_mean_force_bank requires loss_type='tsm' with tsm_type='noise_cutoff', loss_type='sc' "
+                         "with sc_switch=True and a non-mode_mixture sg_type, or loss_type='fdual' with "
+                         "fdual_schedule='cutoff'.")
     path = options["tsm_mean_force_bank"]
     bank = np.load(path)
     meta = json.loads(str(bank["meta"]))
@@ -189,6 +193,15 @@ def _attach_tsm_bank(train_data: Datapoints, force_losses) -> Datapoints:
         tsm_forces = np.repeat(bank["force_x0"][:, None], bank["t"].shape[1], axis=1)
     else:
         raise ValueError(f"Unknown tsm_bank_target={target!r}; use 'mean_force' or 'force_x0'.")
+    tsm_fx = None
+    if loss_type == "fdual":
+        if target != "mean_force":
+            raise ValueError("loss_type='fdual' with a bank needs tsm_bank_target='mean_force'.")
+        if float(options.get("time_lambda", 0.0)) > 0.0:
+            if "mean_force_dot_x" not in bank:
+                raise ValueError(f"{path} has no mean_force_dot_x (E[F . x0 | x_t]) for the temporal force term of "
+                                 "loss_type='fdual'; recompute it with the current precompute_tsm_mean_force.py.")
+            tsm_fx = jnp.asarray(bank["mean_force_dot_x"], dtype=jnp.float32)
     # fraction of training times ts ~ U(range) that fall into the bank's TSM window
     t1, t0 = ranged_loss.range
     weight = (meta["t_max"] - meta["t_min"]) / (t1 - t0)
@@ -201,6 +214,7 @@ def _attach_tsm_bank(train_data: Datapoints, force_losses) -> Datapoints:
         tsm_t=jnp.asarray(bank["t"], dtype=jnp.float32),
         tsm_noise=jnp.asarray(bank["noise"], dtype=jnp.float32),
         tsm_forces=jnp.asarray(tsm_forces, dtype=jnp.float32),
+        tsm_fx=tsm_fx,
     )
 
 

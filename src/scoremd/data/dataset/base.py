@@ -26,6 +26,9 @@ class Datapoints(struct.PyTreeNode):
     tsm_t: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
     tsm_noise: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
     tsm_forces: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
+    # Optional (N, M): posterior mean E[F(x0) . x0 | x_t] (centred positions, kJ/mol) of each bank draw, the force part
+    # of the temporal target (loss_type='fdual' with a bank).
+    tsm_fx: Optional[jnp.ndarray] = struct.field(default=None, kw_only=True)
 
     def __post_init__(self):
         if self.data.ndim != 2:
@@ -70,6 +73,10 @@ class Datapoints(struct.PyTreeNode):
                     f"tsm_t, tsm_noise, tsm_forces must have shapes (N, M), (N, M, D), (N, M, D) for data {self.data.shape}; "
                     f"got {self.tsm_t.shape}, {self.tsm_noise.shape}, {self.tsm_forces.shape}."
                 )
+            if self.tsm_fx is not None and self.tsm_fx.shape != (n, m):
+                raise ValueError(f"tsm_fx must have shape (N, M) = {(n, m)}; got {self.tsm_fx.shape}.")
+        elif self.tsm_fx is not None:
+            raise ValueError("tsm_fx needs tsm_t, tsm_noise and tsm_forces.")
 
     def __len__(self):
         return self.data.shape[0]
@@ -85,6 +92,7 @@ class Datapoints(struct.PyTreeNode):
             tsm_t=self.tsm_t[idx] if self.tsm_t is not None else None,
             tsm_noise=self.tsm_noise[idx] if self.tsm_noise is not None else None,
             tsm_forces=self.tsm_forces[idx] if self.tsm_forces is not None else None,
+            tsm_fx=self.tsm_fx[idx] if self.tsm_fx is not None else None,
         )
 
 
